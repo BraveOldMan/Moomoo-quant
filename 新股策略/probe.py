@@ -84,6 +84,98 @@ def _check_kline(quote_ctx, code: str) -> dict:
     return {"ok": True, "rows": len(df), "has_ohlcv": needed.issubset(cols)}
 
 
+def _check_intraday_flow(quote_ctx, code: str) -> dict:
+    """日内机构资金流（intraday_flow 因子）。"""
+    try:
+        ret, df = quote_ctx.get_capital_flow(code, period_type=ft.PeriodType.INTRADAY)
+    except Exception as exc:
+        return {"ok": False, "detail": f"异常: {exc}"}
+    if ret != ft.RET_OK or df.empty:
+        return {"ok": False, "detail": str(df)}
+    needed = {"super_in_flow", "big_in_flow"}
+    return {"ok": True, "rows": len(df), "usable": needed.issubset(set(df.columns))}
+
+
+def _check_short(quote_ctx, code: str) -> dict:
+    """做空面（short 因子）：每日卖空比例 + 结算空头拥挤度。"""
+    out: dict = {}
+    try:
+        r = quote_ctx.get_daily_short_volume(code)
+        out["daily_short_volume"] = (
+            r[0] == ft.RET_OK and not r[1].empty and "short_percent" in r[1].columns
+        )
+    except Exception as exc:
+        out["daily_short_volume"] = False
+        out["dsv_err"] = str(exc)
+    try:
+        r = quote_ctx.get_short_interest(code)
+        out["short_interest"] = (
+            r[0] == ft.RET_OK and not r[1].empty and "short_percent" in r[1].columns
+        )
+    except Exception as exc:
+        out["short_interest"] = False
+        out["si_err"] = str(exc)
+    out["ok"] = bool(out.get("daily_short_volume") or out.get("short_interest"))
+    return out
+
+
+def _check_option_iv(quote_ctx, code: str) -> dict:
+    """期权隐含信息（option_iv 因子）：到期日→链→ATM 合约 IV/greeks。"""
+    try:
+        ret, exp = quote_ctx.get_option_expiration_date(code=code)
+    except Exception as exc:
+        return {"ok": False, "detail": f"到期日异常: {exc}"}
+    if ret != ft.RET_OK or exp.empty:
+        return {"ok": False, "detail": "无期权（多数小盘新股上市初期无期权）"}
+    expiry = str(exp.iloc[0]["strike_time"])
+    try:
+        ret2, chain = quote_ctx.get_option_chain(code, start=expiry, end=expiry)
+    except Exception as exc:
+        return {"ok": False, "detail": f"期权链异常: {exc}"}
+    if ret2 != ft.RET_OK or chain.empty:
+        return {"ok": False, "detail": "期权链为空"}
+    opt_code = str(chain.iloc[0]["code"])
+    ret3, snap = quote_ctx.get_market_snapshot([opt_code])
+    has_iv = (
+        ret3 == ft.RET_OK
+        and not snap.empty
+        and "option_implied_volatility" in snap.columns
+    )
+    return {
+        "ok": True,
+        "nearest_expiry": expiry,
+        "strikes": len(chain),
+        "has_iv": has_iv,
+    }
+
+
+def _check_microstructure(quote_ctx, code: str) -> dict:
+    """盘中微观结构（order_flow / obi 因子）：需订阅 TICKER / ORDER_BOOK。"""
+    import time
+
+    try:
+        ret, _ = quote_ctx.subscribe(
+            [code], [ft.SubType.TICKER, ft.SubType.ORDER_BOOK], subscribe_push=False
+        )
+        if ret != ft.RET_OK:
+            return {"ok": False, "detail": "订阅失败（额度/权限）"}
+        time.sleep(1.5)
+        out: dict = {}
+        rt = quote_ctx.get_rt_ticker(code, 20)
+        out["rt_ticker"] = rt[0] == ft.RET_OK and "ticker_direction" in rt[1].columns
+        ob = quote_ctx.get_order_book(code, num=5)
+        out["order_book"] = ob[0] == ft.RET_OK and isinstance(ob[1], dict)
+        out["ok"] = bool(out.get("rt_ticker") and out.get("order_book"))
+        return out
+    except Exception as exc:
+        return {"ok": False, "detail": f"异常: {exc}"}
+    finally:
+        try:
+            quote_ctx.unsubscribe_all()
+        except Exception:
+            pass
+
+
 def probe(codes: list[str]) -> None:
     cfg = StrategyConfig.from_env()
     quote_ctx = ft.OpenQuoteContext(host=cfg.host, port=cfg.port)
@@ -124,6 +216,47 @@ def probe(codes: list[str]) -> None:
             )
             if not bq["ok"]:
                 print(f"  {bq['detail']}")
+
+            # ── 扩展因子（默认关闭，校准后启用）────────────────────────
+            print("  ── 扩展因子数据可得性 ──")
+
+            flow = _check_intraday_flow(quote_ctx, code)
+            print(
+                f"[intraday_flow]        {_status(flow['ok'] and flow.get('usable', False))}"
+            )
+            if not flow["ok"]:
+                print(f"  {flow.get('detail')}")
+
+            sh = _check_short(quote_ctx, code)
+            print(f"[short_metrics]        {_status(sh['ok'])}")
+            print(
+                f"  每日卖空: {_status(sh.get('daily_short_volume', False))}"
+                f"  结算空头: {_status(sh.get('short_interest', False))}"
+            )
+
+            oiv = _check_option_iv(quote_ctx, code)
+            print(
+                f"[option_iv]            {_status(oiv['ok'] and oiv.get('has_iv', False))}"
+            )
+            if oiv["ok"]:
+                print(
+                    f"  最近到期: {oiv['nearest_expiry']}  行权价数: {oiv['strikes']}"
+                    f"  IV字段: {_status(oiv.get('has_iv', False))}"
+                )
+            else:
+                print(f"  {oiv.get('detail')}")
+
+            ms = _check_microstructure(quote_ctx, code)
+            print(
+                f"[microstructure]       {_status(ms['ok'])}  (CVD/OBI，需实时订阅，仅RTH有效)"
+            )
+            if ms["ok"]:
+                print(
+                    f"  逐笔(CVD): {_status(ms.get('rt_ticker', False))}"
+                    f"  盘口(OBI): {_status(ms.get('order_book', False))}"
+                )
+            else:
+                print(f"  {ms.get('detail')}")
     finally:
         quote_ctx.close()
 

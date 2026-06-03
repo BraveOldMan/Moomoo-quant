@@ -11,7 +11,7 @@ IC 解读：本项目因子均为"风险分"（高=看空），故**有效因子
 
 import logging
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import moomoo as ft
 import pandas as pd
@@ -100,6 +100,52 @@ def quantile_returns(
     return {q: sum(v) / len(v) for q, v in buckets.items() if v}
 
 
+# ── 前向 IC（微观因子校准的唯一正道）─────────────────────────────────────
+def _parse_ts(ts: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return None
+
+
+def forward_ic_from_log(
+    records: list,
+    factor: str,
+    horizon_seconds: float,
+    method: str = "spearman",
+) -> ICSummary:
+    """从 SignalLogStore 记录计算前向 IC。
+
+    CVD/OBI 等盘中微观因子无历史回放，只能前向收集：对每条记录，找同一标的
+    在 T+horizon 之后最近一条记录的价格算实际收益，再与当时因子分求相关。
+    有效（风险分高→收益低）应得显著负 IC。
+
+    records：SignalLogRecord 列表（需含 ts/code/last_price/scores）。
+    """
+    by_code: dict[str, list] = {}
+    for r in records:
+        if factor not in getattr(r, "scores", {}):
+            continue
+        by_code.setdefault(r.code, []).append(r)
+
+    factor_vals: list[float] = []
+    fwd_returns: list[float] = []
+    for recs in by_code.values():
+        parsed = [(_parse_ts(r.ts), r) for r in recs]
+        seq = sorted(((t, r) for t, r in parsed if t is not None), key=lambda x: x[0])
+        for i, (t0, r0) in enumerate(seq):
+            target = t0.timestamp() + horizon_seconds
+            future = next((r for t, r in seq[i + 1 :] if t.timestamp() >= target), None)
+            if future is None or r0.last_price <= 0:
+                continue
+            fwd = (future.last_price - r0.last_price) / r0.last_price
+            factor_vals.append(float(r0.scores[factor]))
+            fwd_returns.append(fwd)
+
+    ic = information_coefficient(factor_vals, fwd_returns, method=method)
+    return summarize_ic(ic, len(factor_vals))
+
+
 # ── 取数 + 分析 ─────────────────────────────────────────────────────────
 class FactorAnalyzer:
     def __init__(
@@ -119,7 +165,7 @@ class FactorAnalyzer:
         if ret != ft.RET_OK or kl.empty:
             return pd.DataFrame()
         ret2, cf = self._ctx.get_capital_flow(
-            code, period_type=ft.PeriodType.DAILY, start=start, end=end
+            code, period_type=ft.PeriodType.DAY, start=start, end=end
         )
         if ret2 == ft.RET_OK and not cf.empty:
             cf = cf.rename(columns={"capital_flow_item_time": "time_key"})

@@ -132,7 +132,9 @@ class DataAccess:
             ),
         )
 
-    def get_capital_flow(self, code: str, period_type, start: str, end: str) -> tuple:
+    def get_capital_flow(
+        self, code: str, period_type, start: str | None = None, end: str | None = None
+    ) -> tuple:
         key = f"capflow:{code}:{period_type}:{start}:{end}"
         return self._cached(
             key,
@@ -140,6 +142,51 @@ class DataAccess:
             lambda: self._quote.get_capital_flow(
                 code, period_type=period_type, start=start, end=end
             ),
+        )
+
+    # ── 盘中微观结构 ────────────────────────────────────────────────────
+    def get_rt_ticker(self, code: str, num: int) -> tuple:
+        return self._cached(
+            f"ticker:{code}:{num}",
+            self._cfg.snapshot_cache_ttl_s,
+            lambda: self._quote.get_rt_ticker(code, num),
+        )
+
+    def get_order_book(self, code: str, num: int) -> tuple:
+        return self._cached(
+            f"orderbook:{code}:{num}",
+            self._cfg.snapshot_cache_ttl_s,
+            lambda: self._quote.get_order_book(code, num=num),
+        )
+
+    # ── 做空面（低频，长 TTL）───────────────────────────────────────────
+    def get_short_interest(self, code: str) -> tuple:
+        return self._cached(
+            f"shortint:{code}",
+            self._cfg.short_cache_ttl_s,
+            lambda: self._quote.get_short_interest(code),
+        )
+
+    def get_daily_short_volume(self, code: str) -> tuple:
+        return self._cached(
+            f"shortvol:{code}",
+            self._cfg.short_cache_ttl_s,
+            lambda: self._quote.get_daily_short_volume(code),
+        )
+
+    # ── 期权（IV/PCR 链路）─────────────────────────────────────────────
+    def get_option_expiration_date(self, code: str) -> tuple:
+        return self._cached(
+            f"optexp:{code}",
+            self._cfg.option_cache_ttl_s,
+            lambda: self._quote.get_option_expiration_date(code=code),
+        )
+
+    def get_option_chain(self, code: str, start: str, end: str) -> tuple:
+        return self._cached(
+            f"optchain:{code}:{start}:{end}",
+            self._cfg.option_cache_ttl_s,
+            lambda: self._quote.get_option_chain(code, start=start, end=end),
         )
 
     # ── 交易 ────────────────────────────────────────────────────────────

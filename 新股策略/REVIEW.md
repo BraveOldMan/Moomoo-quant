@@ -103,4 +103,53 @@
 | `persistence.py` | SQLite 持仓恢复（含 qty） |
 | `market_calendar.py` | NYSE 假日表 |
 | `monitor.py` / `alerts.py` | 实时行情订阅 / 多渠道告警 |
-| `tests/` | 55 项纯逻辑单测 |
+| `tests/` | 68 项纯逻辑单测（v1.0 起 55 → v1.2 增至 68） |
+
+---
+
+## 七、v1.1.0 增量 — 专业信号扩展（微观结构 / 做空 / 期权IV）
+
+> 日期：2026-06-03 · 验证：`pytest` 64 项全绿 · 已对近期 IPO `US.RDDT` 实测数据可得性
+
+旧因子集缺少美股盘中真实订单流信号（唯一的 `broker_queue` 是港股专用且默认关闭）。本次新增 5 类、8 个因子，全部经 OpenD 实测落地，沿用「纯函数 + IC 校准 + 默认关闭」约定。
+
+| 新因子（`scores` 键） | 数据接口（实测✅） | 专业信号 | 纯函数 |
+|---|---|---|---|
+| `order_flow` | `get_rt_ticker`（需订阅 TICKER） | CVD 主动买卖盘失衡（美股替代 broker_queue） | `order_flow_score` |
+| `obi` | `get_order_book`（需订阅 ORDER_BOOK） | 盘口失衡 Order-Book Imbalance | `order_book_imbalance_score` |
+| `intraday_flow` | `get_capital_flow` INTRADAY | 日内机构资金流斜率（吸筹 vs 派发） | `flow_trend_score` + `linregress_slope` |
+| `short` | `get_short_interest` + `get_daily_short_volume` | 空头拥挤度 / 每日卖空比例 | `short_squeeze_score` + `short_volume_score` |
+| `option_iv` | 期权链 + 期权 `get_market_snapshot` | IV skew（put−call）/ Put-Call Ratio | `iv_skew_score` + `pcr_score` |
+
+### 关键工程决策
+- **微观因子（CVD/OBI）无历史回放** → 标准历史 IC 不可用。新增 `persistence.SignalLogStore`（`signal_log` 表）做**前向日志**，配 `analysis.forward_ic_from_log()` 用 T+N 实际收益做前向 IC——这是 CVD/OBI 唯一可信校准来源。
+- **RTH 数据门控**：`order_flow` 自动检测逐笔时间戳，盘后（非当日）数据自动跳过（实测盘后 `order_flow` 正确降级、OBI 仍计算）。
+- **全部默认关闭、权重 0**：不影响既有实盘下单，须 IC/前向校准后手动赋权。
+- 顺手修复潜在 Bug：`analysis._fetch` 的 `ft.PeriodType.DAILY`（枚举不存在，会让 `factor_ic` 运行即崩）→ 改为 `DAY`。
+
+### 新增环境变量
+`USE_ORDER_FLOW` / `USE_ORDER_BOOK_IMBALANCE` / `USE_INTRADAY_FLOW` / `USE_SHORT_METRICS` / `SHORT_SQUEEZE_REVERSE` / `USE_OPTION_IV`（均默认 `False`）。`probe.py` 已固化这 5 类接口的可得性检查。
+
+---
+
+## 八、v1.2.0 增量 — 通用化（不限新股，适用任意美股）
+
+> 日期：2026-06-03 · 验证：`pytest` 68 项全绿 · 已对成熟股 `US.AAPL` 冒烟通过
+
+信号引擎本就 symbol-agnostic；IPO 耦合仅在 universe 构建、锁定期因子、换手率阈值三处。本次解耦，**完全向后兼容**（自选清单默认空 → 行为与 v1.1 一致）。
+
+| 维度 | 实现 |
+|---|---|
+| **Universe** | 保留 IPO 扫描；新增自选清单 `watchlist`（环境变量 `WATCHLIST=US.AAPL,US.TSLA`）。运行时 universe = IPO扫描 ∪ 自选清单 ∪ 现有持仓 |
+| **换手率阈值** | 按标的**自动分 profile**（`signals._turnover_thresholds`）：近期 IPO 走高阈值 `80/150`，成熟股走 `general_turnover_warning/danger=5/15`。解决"成熟股 ~3% 换手被 IPO 阈值误判为零风险" |
+| **锁定期因子** | 非 IPO 标的无上市日 → 自动 no-op（原逻辑已支持） |
+| **包名** | 保留「新股策略」，仅泛化行为与文档，零迁移风险 |
+
+### 用法
+```bash
+python -m 新股策略.main                                   # 仅 IPO（与历史一致）
+WATCHLIST=US.AAPL,US.TSLA,US.NVDA python -m 新股策略.main  # IPO + 任意美股
+```
+
+### 测试增量
+`tests/test_features.py` +11（新因子纯函数）、`tests/test_universe_profile.py` +4（profile 选择 + watchlist 解析）。当前共 **68 项**全绿。

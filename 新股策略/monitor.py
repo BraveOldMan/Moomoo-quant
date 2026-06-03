@@ -31,9 +31,16 @@ class _QuotePushHandler(ft.StockQuoteHandlerBase):
 
 
 class RealtimeMonitor:
-    def __init__(self, quote_ctx: ft.OpenQuoteContext, callback: OnQuoteCallback):
+    def __init__(
+        self,
+        quote_ctx: ft.OpenQuoteContext,
+        callback: OnQuoteCallback,
+        extra_sub_types: list | None = None,
+    ):
         self._ctx = quote_ctx
         self._callback = callback
+        # QUOTE 必订；微观结构因子（CVD/OBI）启用时追加 TICKER/ORDER_BOOK
+        self._sub_types = [ft.SubType.QUOTE, *(extra_sub_types or [])]
         self._subscribed: set[str] = set()
         self._lock = threading.Lock()
 
@@ -46,7 +53,7 @@ class RealtimeMonitor:
         new_codes = [c for c in codes if c not in self._subscribed]
         if not new_codes:
             return
-        ret, msg = self._ctx.subscribe(new_codes, [ft.SubType.QUOTE])
+        ret, msg = self._ctx.subscribe(new_codes, self._sub_types)
         if ret != ft.RET_OK:
             logger.error("订阅失败 %s: %s", new_codes, msg)
             return

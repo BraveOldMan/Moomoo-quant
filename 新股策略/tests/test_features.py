@@ -68,6 +68,70 @@ def test_vwap_score_above_below():
     assert F.vwap_score(100, 0) == 50.0
 
 
+# ── 盘中微观结构 ────────────────────────────────────────────────────────
+def test_order_flow_score_net_buying_low_risk():
+    buy_heavy = F.order_flow_score(buy_vol=900, sell_vol=100)
+    sell_heavy = F.order_flow_score(buy_vol=100, sell_vol=900)
+    balanced = F.order_flow_score(buy_vol=500, sell_vol=500)
+    assert buy_heavy < balanced < sell_heavy
+    assert balanced == pytest.approx(50.0)
+
+
+def test_order_flow_score_extremes_and_zero():
+    assert F.order_flow_score(1000, 0) == pytest.approx(0.0)
+    assert F.order_flow_score(0, 1000) == pytest.approx(100.0)
+    assert F.order_flow_score(0, 0) == 50.0
+
+
+def test_order_book_imbalance_score_bid_heavy_low_risk():
+    bid_heavy = F.order_book_imbalance_score(bid_depth=800, ask_depth=200)
+    ask_heavy = F.order_book_imbalance_score(bid_depth=200, ask_depth=800)
+    assert bid_heavy < 50 < ask_heavy
+    assert F.order_book_imbalance_score(0, 0) == 50.0
+
+
+def test_linregress_slope_directions():
+    assert F.linregress_slope([1, 2, 3, 4]) == pytest.approx(1.0)
+    assert F.linregress_slope([4, 3, 2, 1]) == pytest.approx(-1.0)
+    assert F.linregress_slope([5, 5, 5]) == pytest.approx(0.0)
+    assert F.linregress_slope([1]) is None
+
+
+def test_flow_trend_score_accumulation_low_risk():
+    accumulate = F.flow_trend_score(slope=1000, turnover_usd=10_000_000)
+    distribute = F.flow_trend_score(slope=-1000, turnover_usd=10_000_000)
+    assert accumulate < 50 < distribute
+    assert F.flow_trend_score(100, 0) == 50.0
+
+
+# ── 做空面 ──────────────────────────────────────────────────────────────
+def test_short_volume_score_monotonic():
+    assert F.short_volume_score(0) == pytest.approx(0.0)
+    assert F.short_volume_score(15) == pytest.approx(50.0)
+    assert F.short_volume_score(60) == 100.0  # clamp
+
+
+def test_short_squeeze_score_higher_crowding_higher_base():
+    low = F.short_squeeze_score(short_percent=5, days_to_cover=2)
+    high = F.short_squeeze_score(short_percent=12, days_to_cover=6)
+    assert low < high
+
+
+# ── 期权隐含信息 ────────────────────────────────────────────────────────
+def test_iv_skew_score_put_expensive_high_risk():
+    fear = F.iv_skew_score(put_iv=80, call_iv=60)
+    calm = F.iv_skew_score(put_iv=60, call_iv=80)
+    assert fear > 50 > calm
+    assert F.iv_skew_score(0, 60) == 50.0
+
+
+def test_pcr_score_high_puts_high_risk():
+    bearish = F.pcr_score(put_oi=2000, call_oi=1000)
+    bullish = F.pcr_score(put_oi=500, call_oi=1000)
+    assert bearish > 50 > bullish
+    assert F.pcr_score(0, 0) == 50.0
+
+
 # ── 组合评分归一化 ──────────────────────────────────────────────────────
 def test_score_from_features_normalizes_missing():
     # 只有两个因子可用，权重应自动归一化

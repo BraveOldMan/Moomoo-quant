@@ -93,6 +93,108 @@ def vwap_score(last: float, vwap: float) -> float:
     return _clamp(50.0 - dev * 500.0)
 
 
+# ── 盘中微观结构 ────────────────────────────────────────────────────────
+def order_flow_score(buy_vol: float, sell_vol: float) -> float:
+    """主动买卖盘失衡（CVD）风险分。
+
+    imbalance =(主动买 − 主动卖)/(主动买 + 主动卖)，∈[-1,1]。
+    净主动买入（imbalance>0）→ 多头主导 → 低风险；净卖出→高风险。
+    数据来自 get_rt_ticker 的 ticker_direction(BUY/SELL)，是美股可用的
+    order-flow 信号，替代港股专用的 broker_queue。
+    """
+    total = buy_vol + sell_vol
+    if total <= 0:
+        return 50.0
+    imbalance = (buy_vol - sell_vol) / total
+    return _clamp(50.0 - imbalance * 50.0)
+
+
+def order_book_imbalance_score(bid_depth: float, ask_depth: float) -> float:
+    """盘口失衡 OBI 风险分。
+
+    OBI =(买盘挂单量 − 卖盘挂单量)/(买盘 + 卖盘)，∈[-1,1]。
+    买盘更厚（OBI>0）→ 支撑强 → 低风险；卖盘压制→高风险。
+    取自 get_order_book 前 N 档累计挂单量。
+    """
+    total = bid_depth + ask_depth
+    if total <= 0:
+        return 50.0
+    obi = (bid_depth - ask_depth) / total
+    return _clamp(50.0 - obi * 50.0)
+
+
+def linregress_slope(values: list[float]) -> float | None:
+    """对等间隔序列做最小二乘斜率（x=0,1,2,...）。点数不足返回 None。"""
+    n = len(values)
+    if n < 2:
+        return None
+    mean_x = (n - 1) / 2.0
+    mean_y = sum(values) / n
+    denom = sum((i - mean_x) ** 2 for i in range(n))
+    if denom <= 0:
+        return None
+    num = sum((i - mean_x) * (values[i] - mean_y) for i in range(n))
+    return num / denom
+
+
+def flow_trend_score(slope: float, turnover_usd: float) -> float:
+    """日内机构资金流斜率风险分。
+
+    slope = 累计(super+big)净流入序列的每分钟斜率（美元/分钟）。
+    按成交额归一化消除规模差异：吸筹（斜率>0）→低风险，派发→高风险。
+    """
+    if turnover_usd <= 0:
+        return 50.0
+    intensity = slope / turnover_usd  # 每分钟净流入占成交额比例
+    return _clamp(50.0 - intensity * 25_000.0)
+
+
+# ── 做空面 ──────────────────────────────────────────────────────────────
+def short_volume_score(daily_short_pct: float) -> float:
+    """每日卖空占比风险分：当日成交中卖空比例越高，抛压越大→高风险。
+
+    daily_short_pct 为百分数（如 13.6 表示 13.6%）。中枢约 15%（美股常见）。
+    """
+    return _clamp(daily_short_pct * (50.0 / 15.0))
+
+
+def short_squeeze_score(short_percent: float, days_to_cover: float) -> float:
+    """空头拥挤度风险分（结算 short interest，双月、滞后）。
+
+    方向需 IC 校准：高 short% / 高 days_to_cover 既是潜在抛压、也是逼空燃料。
+    此处给温和的"高拥挤=偏高风险"基线映射（short% 10% → 50 中枢），
+    校准为负 IC（拥挤反而预示反弹）时可在 config 反向。
+    """
+    base = _clamp(short_percent * (50.0 / 10.0))
+    # days_to_cover 高 → 平仓困难，轻微加权
+    adj = _clamp(base + (days_to_cover - 3.0) * 2.0)
+    return adj
+
+
+# ── 期权隐含信息 ────────────────────────────────────────────────────────
+def iv_skew_score(put_iv: float, call_iv: float) -> float:
+    """IV 偏斜风险分：put_iv − call_iv > 0（put 偏贵）= 下行恐慌→高风险。
+
+    IV 为百分数（如 70.0）。每 10 个点偏斜 ≈ 25 分。
+    """
+    if put_iv <= 0 or call_iv <= 0:
+        return 50.0
+    skew = put_iv - call_iv
+    return _clamp(50.0 + skew * 2.5)
+
+
+def pcr_score(put_oi: float, call_oi: float) -> float:
+    """Put/Call 持仓量比风险分：PCR 高（看跌持仓多）→高风险。
+
+    PCR=1 → 50 中枢；PCR=2 → 100，PCR=0 → 0。
+    """
+    total = put_oi + call_oi
+    if total <= 0:
+        return 50.0
+    pcr = put_oi / call_oi if call_oi > 0 else 2.0
+    return _clamp(pcr * 50.0)
+
+
 # ── 组合评分 ────────────────────────────────────────────────────────────
 def score_from_features(scores: dict[str, float], weights: dict[str, float]) -> float:
     """按"数据可用且权重>0"的因子做归一化加权。

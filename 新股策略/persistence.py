@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """SQLite 持久化：进程重启后恢复持仓状态（含加权成本所需的 qty）。"""
 
+import json
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 
@@ -97,3 +98,73 @@ class PositionStore:
             )
             for row in rows
         }
+
+
+@dataclass
+class SignalLogRecord:
+    ts: str  # ISO8601 UTC 时间戳
+    code: str
+    last_price: float
+    scores: dict[str, float]  # 各因子风险分快照
+
+
+class SignalLogStore:
+    """前向日志：落库每次评分的因子分 + 当时价格。
+
+    微观结构因子（CVD/OBI）无历史回放，唯一可信的校准方式是前向收集——
+    记录 (T 时刻因子分, 价格)，待 T+N 真实收益出现后用 analysis 的前向 IC 评估。
+    与 PositionStore 共用同一 SQLite 文件（不同表），复用连接模式。
+    """
+
+    def __init__(self, db_path: str = "新股策略/positions.db"):
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._path = db_path
+        self._init_db()
+
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self._path)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS signal_log (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts         TEXT NOT NULL,
+                    code       TEXT NOT NULL,
+                    last_price REAL NOT NULL,
+                    scores     TEXT NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_signal_log_code ON signal_log(code, ts)"
+            )
+
+    def log(self, code: str, last_price: float, scores: dict[str, float]) -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                "INSERT INTO signal_log (ts, code, last_price, scores) VALUES (?,?,?,?)",
+                (ts, code, last_price, json.dumps(scores)),
+            )
+
+    def load(self, code: str | None = None) -> list[SignalLogRecord]:
+        sql = "SELECT ts, code, last_price, scores FROM signal_log"
+        params: tuple = ()
+        if code is not None:
+            sql += " WHERE code = ?"
+            params = (code,)
+        sql += " ORDER BY ts"
+        with self._conn() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            SignalLogRecord(
+                ts=r[0], code=r[1], last_price=r[2], scores=json.loads(r[3])
+            )
+            for r in rows
+        ]

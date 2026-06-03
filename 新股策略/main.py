@@ -37,7 +37,7 @@ from .config import Signal, StrategyConfig
 from .data_access import DataAccess
 from .market_calendar import get_nyse_holidays
 from .monitor import RealtimeMonitor
-from .persistence import PositionRecord, PositionStore
+from .persistence import PositionRecord, PositionStore, SignalLogStore
 from .signals import SignalCalculator
 from .strategy import IPOStrategy
 from .trader import Trader
@@ -142,7 +142,8 @@ def run() -> None:
         logger.info("运行在模拟交易模式")
 
     data = DataAccess(quote_ctx, trade_ctx, cfg)
-    calculator = SignalCalculator(data, cfg)
+    signal_log = SignalLogStore(cfg.db_path)
+    calculator = SignalCalculator(data, cfg, signal_log=signal_log)
     strategy = IPOStrategy(calculator, cfg)
     trader = Trader(trade_ctx, data, cfg)
     store = PositionStore(cfg.db_path)
@@ -238,10 +239,22 @@ def run() -> None:
     consumer_thread.start()
 
     # 行情推送只投递事件，不直接下单
-    monitor = RealtimeMonitor(quote_ctx, lambda c, p: events.put((c, p)))
+    # 微观结构因子（CVD/OBI）启用时追加实时订阅类型
+    extra_subs = []
+    if cfg.use_order_flow:
+        extra_subs.append(ft.SubType.TICKER)
+    if cfg.use_order_book_imbalance:
+        extra_subs.append(ft.SubType.ORDER_BOOK)
+    monitor = RealtimeMonitor(
+        quote_ctx, lambda c, p: events.put((c, p)), extra_sub_types=extra_subs
+    )
     monitor.start()
     if saved:
         monitor.subscribe(list(saved.keys()))
+    # 自选 universe（非 IPO 的通用美股）：启动即订阅，全程纳入分析
+    if cfg.watchlist:
+        monitor.subscribe(list(cfg.watchlist))
+        logger.info("自选 universe %d 只: %s", len(cfg.watchlist), list(cfg.watchlist))
 
     try:
         while True:
@@ -258,7 +271,10 @@ def run() -> None:
                 calculator.set_listing_dates(ipo_map)
                 monitor.subscribe(list(ipo_map.keys()))
 
-            all_codes = set(ipo_map.keys()) | strategy.get_active_codes()
+            # universe = IPO 扫描 ∪ 自选清单 ∪ 现有持仓
+            all_codes = (
+                set(ipo_map.keys()) | set(cfg.watchlist) | strategy.get_active_codes()
+            )
             for code in all_codes:
                 price, _ = _get_snapshot(data, code)
                 if price is not None:

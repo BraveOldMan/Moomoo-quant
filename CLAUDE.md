@@ -127,28 +127,46 @@ set_futu_debug_model(True)  # 启用详细日志，输出至 %APPDATA%\com.moomo
 
 模拟环境使用 `trd_env=ft.TrdEnv.SIMULATE`，实盘使用 `ft.TrdEnv.REAL`。
 
-## 新股 IPO 策略（`新股策略/`）
+## 美股量化策略（`新股策略/`）
 
-针对美股新股的实盘策略包，已完成系统性升级。完整的检查与升级记录见 `新股策略/REVIEW.md`。
+> 包名仍为「新股策略」（保留以零迁移风险），但自 v1.2.0 起已**不限于新股**：
+> 既能自动扫描 IPO，也能通过自选清单（`WATCHLIST`）分析任意美股，同一套因子引擎共用。
+
+针对美股的实盘策略包，已完成系统性升级。完整的检查与升级记录见 `新股策略/REVIEW.md`（含 v1.1/v1.2 增量）。
 
 ### 模块架构
 
 ```
 main.py          单线程事件队列编排（推送+轮询统一投递，串行消费，无并发下单竞态）
+                 universe = IPO 扫描 ∪ 自选清单(WATCHLIST) ∪ 现有持仓
   ├─ data_access.py   TTL 缓存 + 令牌桶限流的行情/交易数据门面（防撞频，单查复用）
+  │                   含微观结构(rt_ticker/order_book)、做空(short)、期权链封装
   ├─ signals.py       经 data_access 取数 → 调 features 评分；缺失因子自动降级
+  │    │              换手率阈值按标的自动分 IPO/成熟股 profile
   │    └─ features.py 统一特征与纯函数评分（实盘/回测共用，杜绝"测的不是跑的"）
   ├─ strategy.py      决策核心：加权成本、交易日 PDT、熔断基准锚定、RLock 加锁
   ├─ trader.py        marketable-limit 限价执行 + 成交轮询 + 新开仓/加仓区分
-  ├─ persistence.py   SQLite 持仓恢复（含 qty，支持旧库迁移）
+  ├─ persistence.py   SQLite 持仓恢复（含 qty）+ SignalLogStore 前向日志(signal_log)
   ├─ market_calendar.py  NYSE 假日表
-  └─ alerts.py / monitor.py  多渠道告警 / 实时行情订阅
+  └─ alerts.py / monitor.py  多渠道告警 / 实时行情订阅(QUOTE + 可选 TICKER/ORDER_BOOK)
 
 backtest.py      同源回测 + 佣金/滑点成本 + SPY 基准/Alpha + Sharpe/Sortino/Calmar + walk-forward
-analysis.py      因子 IC/IR、分层回测、锁定期事件研究（CAR）——用于校准 features 权重
-probe.py         数据可得性探针（上线前实测美股各接口字段）
-tests/           55 项纯逻辑单测
+analysis.py      因子 IC/IR、分层回测、锁定期事件研究（CAR）+ forward_ic_from_log（微观因子前向校准）
+probe.py         数据可得性探针（上线前实测美股各接口字段，含微观/做空/期权扩展因子）
+tests/           68 项纯逻辑单测
 ```
+
+### 因子总览（评分均为 0–100 风险分；新增因子默认关闭、权重 0）
+
+| 组别 | 因子（`scores` 键） | 数据源 |
+|---|---|---|
+| 核心 | turnover / capital / momentum | snapshot / capital_distribution |
+| 技术 | orb / rs / vwap / ATR 仓位 | history_kline |
+| 盘中微观结构 | order_flow(CVD) / obi / intraday_flow | rt_ticker / order_book / capital_flow INTRADAY |
+| 做空面 | short | short_interest / daily_short_volume |
+| 期权隐含 | option_iv（IV skew + PCR） | option_chain + 期权 snapshot |
+
+> 微观结构因子无历史回放 → 用 `SignalLogStore` 前向日志 + `analysis.forward_ic_from_log` 校准。
 
 ### 关键约定（本策略包）
 
@@ -156,15 +174,19 @@ tests/           55 项纯逻辑单测
   有效因子的 IC 应显著为负。
 - **因子权重**：用 `config.active_weights()` 输出当前启用因子；`features.score_from_features`
   对数据缺失的因子自动剔除并归一化。
-- **稳健默认**：新因子（RS/ORB/VWAP）默认关闭，须先用 `analysis.FactorAnalyzer.factor_ic()`
-  校准后再启用；限价执行默认开启；ATR 仓位默认关闭。全部经环境变量切换（见 `main.py` docstring）。
+- **稳健默认**：所有新因子（RS/ORB/VWAP、microstructure、short、option_iv）默认关闭、权重 0，
+  须先用 `analysis.FactorAnalyzer.factor_ic()`（有历史的因子）或 `forward_ic_from_log()`
+  （微观因子）校准后再启用；限价执行默认开启；ATR 仓位默认关闭。全部经环境变量切换（见 `main.py` docstring）。
+- **universe 通用化**：`WATCHLIST=US.AAPL,US.TSLA` 把任意美股纳入分析（默认空=仅 IPO 扫描）。
+  自选标的无上市日 → 锁定期因子 no-op、换手率走成熟股 profile（阈值 `5/15`，低于 IPO 的 `80/150`）。
 - **数据可得性风险**：`get_capital_distribution`、`get_broker_queue` 在美股可能不可用——
   上线前必须先跑 `python -m 新股策略.probe US.XXX` 确认核心因子落地。
 
 ### 常用命令
 
 ```bash
-python -m 新股策略.probe US.RDDT US.ARM   # 数据可得性探针（需 OpenD）
-python -m 新股策略.main                    # 运行实盘/模拟策略（需 OpenD）
-pytest 新股策略/tests/ -q                  # 运行单测（无需 OpenD）
+python -m 新股策略.probe US.RDDT US.ARM   # 数据可得性探针（需 OpenD，含扩展因子）
+python -m 新股策略.main                    # 仅 IPO 扫描（需 OpenD）
+WATCHLIST=US.AAPL,US.TSLA python -m 新股策略.main  # IPO + 任意美股（需 OpenD）
+pytest 新股策略/tests/ -q                  # 运行 68 项单测（无需 OpenD）
 ```

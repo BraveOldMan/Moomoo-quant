@@ -22,6 +22,11 @@ class StrategyConfig:
     ipo_days_window: int = 10  # 只关注上市后 N 天内的新股
     markets: tuple = ("US",)  # 本仓库专注美股
 
+    # ── 通用 universe（除 IPO 扫描外，额外纳入的自选美股）──────────────
+    # 空=仅 IPO 扫描（与历史行为一致）；填入即对任意美股做同一套因子分析。
+    # 自选标的无上市日 → 锁定期因子自动 no-op、换手率走"成熟股"阈值 profile。
+    watchlist: tuple = ()  # 如 ("US.AAPL", "US.TSLA", "US.NVDA")
+
     # ── 交易时段（America/New_York，自动处理 EDT/EST）──────────────────
     market_timezone: str = "America/New_York"
     market_open: str = "09:30"
@@ -40,9 +45,13 @@ class StrategyConfig:
     atr_stop_multiple: float = 2.0  # 止损距离 = ATR × 该倍数
     atr_risk_per_trade_pct: float = 0.01  # 单笔最大风险占净值比例（1%）
 
-    # ── 换手率阈值（美股 IPO 首日 50%–300%）──────────────────────────
+    # ── 换手率阈值（按标的自动分 profile，见 signals._turnover_thresholds）─
+    # IPO profile：新股首日换手率常 50%–300%
     turnover_warning: float = 80.0
     turnover_danger: float = 150.0
+    # 成熟股 profile：日换手率通常 0.5%–10%，故阈值远低于 IPO
+    general_turnover_warning: float = 5.0
+    general_turnover_danger: float = 15.0
 
     # ── 机构资金分布阈值 ────────────────────────────────────────────────
     inst_outflow_warning: float = 0.55
@@ -63,6 +72,24 @@ class StrategyConfig:
     # ── VWAP 偏离 ───────────────────────────────────────────────────────
     use_vwap_signal: bool = False
 
+    # ── 盘中微观结构（美股 order-flow，替代港股 broker_queue）────────────
+    # 三者均依赖实时订阅（TICKER/ORDER_BOOK）或 INTRADAY 资金流；无历史回放，
+    # 须靠 forward-logging 前向校准后再赋权启用。默认全关、权重 0。
+    use_order_flow: bool = False  # CVD 主动买卖盘失衡（get_rt_ticker）
+    rt_ticker_num: int = 500  # 逐笔回看根数
+    use_order_book_imbalance: bool = False  # 盘口失衡 OBI（get_order_book）
+    obi_levels: int = 5  # 盘口累计档位数
+    use_intraday_flow: bool = False  # 日内机构资金流斜率（get_capital_flow INTRADAY）
+    flow_slope_window: int = 30  # 斜率回看的分钟根数
+
+    # ── 做空面 ──────────────────────────────────────────────────────────
+    use_short_metrics: bool = False  # 空头拥挤度 / 每日卖空比例
+    short_squeeze_reverse: bool = False  # True=拥挤视为偏多（IC 校准为负时启用）
+
+    # ── 期权隐含信息（IV skew / Put-Call Ratio；仅有期权的 IPO 可用）────
+    use_option_iv: bool = False
+    option_iv_max_expiry_days: int = 45  # 只取最近 N 天内到期的合约算 IV
+
     # ── 因子权重（启用且数据可用的因子在评分时自动归一化）──────────────
     # 新因子默认权重 0：建议先用 analysis.py 做 IC 校准再启用。
     w_turnover: float = 0.25
@@ -72,6 +99,11 @@ class StrategyConfig:
     w_orb: float = 0.20
     w_rs: float = 0.15
     w_vwap: float = 0.10
+    w_order_flow: float = 0.0  # 微观结构：须前向校准后再赋权
+    w_obi: float = 0.0
+    w_intraday_flow: float = 0.0
+    w_short: float = 0.0  # 做空面
+    w_option_iv: float = 0.0  # 期权隐含
 
     # ── 锁定期预警 ──────────────────────────────────────────────────────
     lockup_days: int = 180  # 标准锁定期天数
@@ -111,6 +143,8 @@ class StrategyConfig:
     kline_cache_ttl_s: float = 60.0
     capital_cache_ttl_s: float = 30.0
     position_cache_ttl_s: float = 3.0
+    short_cache_ttl_s: float = 3600.0  # 做空数据低频（日/双月），长缓存
+    option_cache_ttl_s: float = 300.0  # 期权链/到期日变动慢
 
     # ── API 限流（moomoo 约 30 次/30 秒，留余量）───────────────────────
     api_rate_limit: int = 28
@@ -145,6 +179,17 @@ class StrategyConfig:
             trade_password=os.environ.get("TRADE_PASSWORD", ""),
             trd_env=os.environ.get("TRADE_ENV", "SIMULATE"),
             ipo_days_window=int(os.environ.get("IPO_DAYS_WINDOW", "10")),
+            watchlist=tuple(
+                c.strip()
+                for c in os.environ.get("WATCHLIST", "").split(",")
+                if c.strip()
+            ),
+            general_turnover_warning=float(
+                os.environ.get("GENERAL_TURNOVER_WARNING", "5.0")
+            ),
+            general_turnover_danger=float(
+                os.environ.get("GENERAL_TURNOVER_DANGER", "15.0")
+            ),
             position_ratio=float(os.environ.get("POSITION_RATIO", "0.2")),
             max_positions=int(os.environ.get("MAX_POSITIONS", "3")),
             entry_tranches=int(os.environ.get("ENTRY_TRANCHES", "2")),
@@ -167,6 +212,12 @@ class StrategyConfig:
             use_orb=_bool("USE_ORB", False),
             use_rs=_bool("USE_RS", False),
             use_vwap_signal=_bool("USE_VWAP_SIGNAL", False),
+            use_order_flow=_bool("USE_ORDER_FLOW", False),
+            use_order_book_imbalance=_bool("USE_ORDER_BOOK_IMBALANCE", False),
+            use_intraday_flow=_bool("USE_INTRADAY_FLOW", False),
+            use_short_metrics=_bool("USE_SHORT_METRICS", False),
+            short_squeeze_reverse=_bool("SHORT_SQUEEZE_REVERSE", False),
+            use_option_iv=_bool("USE_OPTION_IV", False),
             db_path=os.environ.get("DB_PATH", "新股策略/positions.db"),
             alert_email=os.environ.get("ALERT_EMAIL", ""),
             alert_smtp_host=os.environ.get("SMTP_HOST", "smtp.gmail.com"),
@@ -192,4 +243,14 @@ class StrategyConfig:
             weights["rs"] = self.w_rs
         if self.use_vwap_signal:
             weights["vwap"] = self.w_vwap
+        if self.use_order_flow:
+            weights["order_flow"] = self.w_order_flow
+        if self.use_order_book_imbalance:
+            weights["obi"] = self.w_obi
+        if self.use_intraday_flow:
+            weights["intraday_flow"] = self.w_intraday_flow
+        if self.use_short_metrics:
+            weights["short"] = self.w_short
+        if self.use_option_iv:
+            weights["option_iv"] = self.w_option_iv
         return weights
