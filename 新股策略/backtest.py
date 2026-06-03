@@ -186,7 +186,7 @@ class BacktestEngine:
             logger.warning("K 线获取失败 %s: %s", code, kl)
             return pd.DataFrame()
         ret2, cf = self._ctx.get_capital_flow(
-            code, period_type=ft.PeriodType.DAILY, start=start, end=end
+            code, period_type=ft.PeriodType.DAY, start=start, end=end
         )
         if ret2 == ft.RET_OK and not cf.empty:
             cf = cf.rename(columns={"capital_flow_item_time": "time_key"})
@@ -241,7 +241,9 @@ class BacktestEngine:
                 high = float(row.get("high") or close)
                 low = float(row.get("low") or close)
                 turnover_usd = float(row.get("turnover") or 0)
-                turnover_rate = float(row.get("turnover_rate") or 0)
+                # K 线 turnover_rate 为小数(0.01=1%)，×100 转百分数，
+                # 与 snapshot/阈值(turnover_warning 等)口径一致
+                turnover_rate = float(row.get("turnover_rate") or 0) * 100.0
                 main_flow = float(row.get("main_in_flow") or 0)
 
                 h = history.setdefault(code, {"close": [], "high": [], "low": []})

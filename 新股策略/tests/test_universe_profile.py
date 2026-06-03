@@ -54,3 +54,38 @@ def test_watchlist_from_env(monkeypatch):
 
 def test_watchlist_default_empty():
     assert StrategyConfig().watchlist == ()
+
+
+# ── IPO 列表解析（回归：列名 list_time + 排除未上市预计 IPO）──────────────
+def test_fetch_recent_ipos_parses_list_time_column():
+    import pandas as pd
+
+    from datetime import timedelta
+
+    from 新股策略.main import _fetch_recent_ipos
+
+    today = date.today()
+    df = pd.DataFrame(
+        {
+            "code": ["US.NEW", "US.OLD", "US.FUTURE"],
+            "name": ["New Co", "Old Co", "Future Co"],
+            # moomoo 真实列名为 list_time（非 listing/ipo_date）
+            "list_time": [
+                today.isoformat(),
+                (today - timedelta(days=90)).isoformat(),
+                (today + timedelta(days=5)).isoformat(),  # 尚未上市的预计 IPO
+            ],
+        }
+    )
+
+    class _FakeQuote:
+        def get_ipo_list(self, market):
+            return 0, df  # RET_OK
+
+    class _FakeData:
+        _quote = _FakeQuote()
+
+    result = _fetch_recent_ipos(_FakeData(), markets=("US",), days=10)
+
+    # 只保留近 10 天内"已上市"的 US.NEW；排除过期 US.OLD 与未上市 US.FUTURE
+    assert result == {"US.NEW": today}

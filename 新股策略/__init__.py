@@ -9,7 +9,7 @@ from .backtest import BacktestEngine, BacktestResult
 from .analysis import FactorAnalyzer, forward_ic_from_log
 from .persistence import PositionRecord, PositionStore, SignalLogRecord, SignalLogStore
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 __all__ = [
     "__version__",

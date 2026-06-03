@@ -79,16 +79,20 @@ def _fetch_recent_ipos(data: DataAccess, markets: tuple, days: int) -> dict[str,
     cutoff = date.today() - timedelta(days=days)
     result: dict[str, date] = {}
     for market in markets:
-        ret, df = data._quote.get_ipo_list(market)  # IPO 列表低频，无需缓存
+        # 显式用 ft.Market 枚举（文档约定）；字符串无对应枚举时回退原值
+        mkt = getattr(ft.Market, market, market)
+        ret, df = data._quote.get_ipo_list(mkt)  # IPO 列表低频，无需缓存
         if ret != ft.RET_OK or df.empty:
             if ret != ft.RET_OK:
                 logger.warning("get_ipo_list 失败 market=%s: %s", market, df)
             continue
+        # moomoo get_ipo_list 的上市日列名为 list_time（美股为预计上市日）；
+        # 保留 listing/ipo_date 模糊匹配作兜底，防 SDK 版本差异。
         date_col = next(
             (
                 c
                 for c in df.columns
-                if "listing" in c.lower() or "ipo_date" in c.lower()
+                if c == "list_time" or "listing" in c.lower() or "ipo_date" in c.lower()
             ),
             None,
         )
@@ -96,10 +100,12 @@ def _fetch_recent_ipos(data: DataAccess, markets: tuple, days: int) -> dict[str,
         if date_col is None or code_col is None:
             logger.warning("IPO 列表列名未识别 cols=%s", df.columns.tolist())
             continue
+        today = date.today()
         for _, row in df.iterrows():
             try:
                 listing_date = date.fromisoformat(str(row[date_col])[:10])
-                if listing_date >= cutoff:
+                # 仅纳入近 N 天内"已上市"的新股；排除尚未上市的预计 IPO
+                if cutoff <= listing_date <= today:
                     result[str(row[code_col])] = listing_date
             except (ValueError, TypeError):
                 continue

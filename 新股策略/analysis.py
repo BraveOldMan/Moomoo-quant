@@ -193,7 +193,8 @@ class FactorAnalyzer:
             for i in range(len(df) - h):
                 fwd = (closes[i + h] - closes[i]) / closes[i] if closes[i] > 0 else 0.0
                 row = df.iloc[i]
-                t_rate = float(row.get("turnover_rate") or 0)
+                # K 线 turnover_rate 为小数(0.01=1%)，×100 转百分数与阈值口径一致
+                t_rate = float(row.get("turnover_rate") or 0) * 100.0
                 t_usd = float(row.get("turnover") or 0)
                 flow = float(row.get("main_in_flow") or 0)
                 panel["turnover"].append(
