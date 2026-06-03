@@ -178,6 +178,7 @@ tests/           68 项纯逻辑单测
   须先用 `analysis.FactorAnalyzer.factor_ic()`（有历史的因子）或 `forward_ic_from_log()`
   （微观因子）校准后再启用；限价执行默认开启；ATR 仓位默认关闭。全部经环境变量切换（见 `main.py` docstring）。
 - **universe 通用化**：`WATCHLIST=US.AAPL,US.TSLA` 把任意美股纳入分析（默认空=仅 IPO 扫描）。
+  观察列表来源优先级：`WATCHLIST` 环境变量 > `新股策略/watchlist.txt`（每行一代码、`#` 注释、`WATCHLIST_FILE` 可改路径）> 空。
   自选标的无上市日 → 锁定期因子 no-op、换手率走成熟股 profile（阈值 `5/15`，低于 IPO 的 `80/150`）。
 - **数据可得性风险**：`get_capital_distribution`、`get_broker_queue` 在美股可能不可用——
   上线前必须先跑 `python -m 新股策略.probe US.XXX` 确认核心因子落地。
@@ -186,7 +187,7 @@ tests/           68 项纯逻辑单测
 
 ```bash
 python -m 新股策略.probe US.RDDT US.ARM   # 数据可得性探针（需 OpenD，含扩展因子）
-python -m 新股策略.main                    # 仅 IPO 扫描（需 OpenD）
-WATCHLIST=US.AAPL,US.TSLA python -m 新股策略.main  # IPO + 任意美股（需 OpenD）
-pytest 新股策略/tests/ -q                  # 运行 68 项单测（无需 OpenD）
+python -m 新股策略.main                    # 自动加载 watchlist.txt（含 MRVL+实盘持仓）+ IPO 扫描
+WATCHLIST=US.AAPL,US.TSLA python -m 新股策略.main  # 环境变量临时覆盖文件（需 OpenD）
+pytest 新股策略/tests/ -q                  # 运行 73 项单测（无需 OpenD）
 ```

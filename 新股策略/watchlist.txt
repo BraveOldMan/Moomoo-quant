@@ -1,0 +1,22 @@
+# 观察列表（WATCHLIST）—— 每行一个美股代码，# 起为注释，空行忽略。
+# 策略启动时自动加载（见 config._load_watchlist）；WATCHLIST 环境变量存在时优先于本文件。
+# 维护：实盘证券账户持仓快照(2026-06-03) + 手动关注标的。港股不纳入（本仓库为美股策略）。
+
+# ── 手动关注 ──
+US.MRVL    # Marvell
+
+# ── 实盘持仓（美股，2026-06-03 快照）──
+US.AMD     # 美国超微
+US.ANET    # Arista Networks
+US.COIN    # Coinbase
+US.INTC    # 英特尔
+US.IREN    # IREN Ltd
+US.ISRG    # 直觉外科
+US.NASA    # Tema Space Innovators ETF
+US.NVDA    # 英伟达
+US.ORCL    # 甲骨文
+US.QSI     # Quantum-Si
+US.RGTI    # Rigetti Computing
+US.RMBS    # Rambus
+US.RXRX    # Recursion Pharmaceuticals
+US.TSLA    # 特斯拉

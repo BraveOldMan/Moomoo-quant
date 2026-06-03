@@ -3,6 +3,36 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 
+_DEFAULT_WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.txt")
+
+
+def _load_watchlist() -> tuple:
+    """加载观察列表：WATCHLIST 环境变量优先，否则回退到 watchlist.txt。
+
+    文件格式：每行一个代码，支持逗号分隔；'#' 起为注释，空行忽略。
+    返回去重保序的代码元组；环境变量与文件均空时返回 ()（=仅 IPO 扫描）。
+    """
+    env = os.environ.get("WATCHLIST", "")
+    if env.strip():
+        raw = [c.strip() for c in env.split(",")]
+    else:
+        path = os.environ.get("WATCHLIST_FILE", _DEFAULT_WATCHLIST_FILE)
+        if not os.path.exists(path):
+            return ()
+        raw = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line:
+                    raw.extend(c.strip() for c in line.split(","))
+    seen: set[str] = set()
+    out: list[str] = []
+    for code in raw:
+        if code and code not in seen:
+            seen.add(code)
+            out.append(code)
+    return tuple(out)
+
 
 class Signal(Enum):
     BUY = "BUY"
@@ -24,6 +54,7 @@ class StrategyConfig:
 
     # ── 通用 universe（除 IPO 扫描外，额外纳入的自选美股）──────────────
     # 空=仅 IPO 扫描（与历史行为一致）；填入即对任意美股做同一套因子分析。
+    # from_env 经 _load_watchlist 填充：WATCHLIST 环境变量优先，否则读 watchlist.txt。
     # 自选标的无上市日 → 锁定期因子自动 no-op、换手率走"成熟股"阈值 profile。
     watchlist: tuple = ()  # 如 ("US.AAPL", "US.TSLA", "US.NVDA")
 
@@ -179,11 +210,7 @@ class StrategyConfig:
             trade_password=os.environ.get("TRADE_PASSWORD", ""),
             trd_env=os.environ.get("TRADE_ENV", "SIMULATE"),
             ipo_days_window=int(os.environ.get("IPO_DAYS_WINDOW", "10")),
-            watchlist=tuple(
-                c.strip()
-                for c in os.environ.get("WATCHLIST", "").split(",")
-                if c.strip()
-            ),
+            watchlist=_load_watchlist(),
             general_turnover_warning=float(
                 os.environ.get("GENERAL_TURNOVER_WARNING", "5.0")
             ),
