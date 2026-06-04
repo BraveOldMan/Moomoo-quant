@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 from datetime import date, timedelta
 
+from .clock import market_date
 from .config import Signal, StrategyConfig
 from .market_calendar import is_trading_day
 from .signals import SignalCalculator, SignalResult
@@ -153,9 +154,14 @@ class IPOStrategy:
         with self._lock:
             self._injected_baseline = value
 
-    def check_and_update_circuit_breaker(self, current_portfolio_value: float) -> bool:
+    def check_and_update_circuit_breaker(
+        self,
+        current_portfolio_value: float,
+        current_date: date | None = None,
+    ) -> bool:
+        """按市场交易日更新组合熔断状态。"""
         with self._lock:
-            today = date.today()
+            today = current_date or market_date(self._cfg.market_timezone)
             if self._circuit_breaker_date != today:
                 self._circuit_breaker_active = False
                 self._circuit_breaker_date = today
@@ -184,11 +190,20 @@ class IPOStrategy:
             return False
 
     # ── 持仓状态 ────────────────────────────────────────────────────────
-    def record_buy(self, code: str, price: float, qty: float) -> None:
+    def record_buy(
+        self,
+        code: str,
+        price: float,
+        qty: float,
+        buy_date: date | None = None,
+    ) -> None:
+        """记录一笔已确认成交的买入。"""
         with self._lock:
             tot_q, tot_c = self._cost_basis.get(code, [0.0, 0.0])
             self._cost_basis[code] = [tot_q + qty, tot_c + price * qty]
-            self._buy_dates.setdefault(code, date.today())
+            self._buy_dates.setdefault(
+                code, buy_date or market_date(self._cfg.market_timezone)
+            )
             self._peak_prices[code] = max(price, self._peak_prices.get(code, price))
             self._tranches_bought[code] = self._tranches_bought.get(code, 0) + 1
 
@@ -247,13 +262,14 @@ class IPOStrategy:
             return None
         return basis[1] / basis[0]
 
-    def _can_sell(self, code: str) -> bool:
+    def _can_sell(self, code: str, current_date: date | None = None) -> bool:
         if self._cfg.min_hold_days <= 0:
             return True
         buy_date = self._buy_dates.get(code)
         if buy_date is None:
             return True
-        return _trading_days_between(buy_date, date.today()) >= self._cfg.min_hold_days
+        today = current_date or market_date(self._cfg.market_timezone)
+        return _trading_days_between(buy_date, today) >= self._cfg.min_hold_days
 
     def _buy_reason(self, r: SignalResult, current_tranches: int) -> str:
         parts = [

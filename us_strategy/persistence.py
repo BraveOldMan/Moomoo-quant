@@ -20,7 +20,7 @@ class PositionRecord:
 
 
 class PositionStore:
-    def __init__(self, db_path: str = "新股策略/positions.db"):
+    def __init__(self, db_path: str = "us_strategy/positions.db"):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
         self._init_db()
@@ -116,7 +116,7 @@ class SignalLogStore:
     与 PositionStore 共用同一 SQLite 文件（不同表），复用连接模式。
     """
 
-    def __init__(self, db_path: str = "新股策略/positions.db"):
+    def __init__(self, db_path: str = "us_strategy/positions.db"):
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._path = db_path
         self._init_db()

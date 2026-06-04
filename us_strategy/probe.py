@@ -10,14 +10,16 @@
 帮助在上线前确认策略是否成立（而非空跑）。
 
 用法：
-    python -m 新股策略.probe US.RDDT US.ARM
-    python 新股策略/probe.py            # 默认探测一批近期美股
+    python -m us_strategy.probe US.RDDT US.ARM
+    python us_strategy/probe.py            # 默认探测一批近期美股
 """
 
 import sys
+from datetime import timedelta
 
 import moomoo as ft
 
+from .clock import market_date
 from .config import StrategyConfig
 
 _DEFAULT_CODES = ["US.AAPL", "US.NVDA"]
@@ -70,10 +72,9 @@ def _check_broker_queue(quote_ctx, code: str) -> dict:
 
 
 def _check_kline(quote_ctx, code: str) -> dict:
-    from datetime import date, timedelta
-
-    end = date.today().isoformat()
-    start = (date.today() - timedelta(days=60)).isoformat()
+    today = market_date(StrategyConfig.market_timezone)
+    end = today.isoformat()
+    start = (today - timedelta(days=60)).isoformat()
     ret, df, _ = quote_ctx.request_history_kline(
         code, start=start, end=end, ktype=ft.KLType.K_DAY, max_count=30
     )

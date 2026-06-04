@@ -19,6 +19,7 @@
 import logging
 import math
 from dataclasses import dataclass, field
+from datetime import date
 from typing import cast
 
 import moomoo as ft
@@ -26,6 +27,7 @@ import pandas as pd
 
 from . import features
 from .config import StrategyConfig
+from .strategy import _trading_days_between
 
 logger = logging.getLogger(__name__)
 
@@ -172,10 +174,12 @@ class BacktestEngine:
         quote_ctx: ft.OpenQuoteContext,
         config: StrategyConfig,
         initial_cash: float = 100_000.0,
+        listing_dates: dict[str, date] | None = None,
     ):
         self._ctx = quote_ctx
         self._cfg = config
         self._initial_cash = initial_cash
+        self._listing_dates = listing_dates or {}
 
     # ── 数据 ────────────────────────────────────────────────────────────
     def _fetch_one(self, code: str, start: str, end: str) -> pd.DataFrame:
@@ -201,6 +205,10 @@ class BacktestEngine:
             return {}
         return {str(r["time_key"]): float(r["close"]) for _, r in df.iterrows()}
 
+    def set_listing_dates(self, dates: dict[str, date]) -> None:
+        """注入 IPO 上市日，用于回测时选择换手率 profile。"""
+        self._listing_dates.update(dates)
+
     # ── 主回测 ──────────────────────────────────────────────────────────
     def run(self, codes: list[str], start: str, end: str) -> BacktestResult:
         cfg = self._cfg
@@ -213,13 +221,7 @@ class BacktestEngine:
         bench = self._fetch_benchmark(start, end)
 
         trade_dates = sorted(all_data["time_key"].unique())
-        weights = {
-            "turnover": cfg.w_turnover,
-            "capital": cfg.w_capital,
-            "momentum": cfg.w_momentum,
-        }
-        if cfg.use_rs:
-            weights["rs"] = cfg.w_rs
+        weights = cfg.active_weights()
 
         cash = self._initial_cash
         positions: dict[str, dict] = {}
@@ -232,8 +234,6 @@ class BacktestEngine:
         for dt in trade_dates:
             dt_key = str(dt)
             day_data = all_data[all_data["time_key"] == dt]
-            if dt_key in bench:
-                bench_closes.append(bench[dt_key])
 
             for _, row in day_data.iterrows():
                 code = str(row["code"])
@@ -241,27 +241,49 @@ class BacktestEngine:
                 high = float(row.get("high") or close)
                 low = float(row.get("low") or close)
                 turnover_usd = float(row.get("turnover") or 0)
-                # K 线 turnover_rate 为小数(0.01=1%)，×100 转百分数，
-                # 与 snapshot/阈值(turnover_warning 等)口径一致
                 turnover_rate = float(row.get("turnover_rate") or 0) * 100.0
                 main_flow = float(row.get("main_in_flow") or 0)
 
-                h = history.setdefault(code, {"close": [], "high": [], "low": []})
+                h = history.setdefault(
+                    code,
+                    {
+                        "close": [],
+                        "high": [],
+                        "low": [],
+                        "turnover": [],
+                        "turnover_rate": [],
+                        "main_flow": [],
+                    },
+                )
+
+                # 信号只能使用上一交易日及以前的数据；当天 close 仅作为执行/估值价。
+                if h["close"]:
+                    score = self._score(code, h, bench_closes, weights)
+                    atr = features.compute_atr(
+                        h["high"], h["low"], h["close"], cfg.atr_period
+                    )
+                    cash, _ = self._apply_decision(
+                        dt_key,
+                        code,
+                        close,
+                        score,
+                        atr,
+                        h["turnover"][-1],
+                        cash,
+                        positions,
+                        trades,
+                    )
+
                 h["close"].append(close)
                 h["high"].append(high)
                 h["low"].append(low)
-
-                score = self._score(
-                    turnover_rate, turnover_usd, main_flow, h, bench_closes, weights
-                )
-                atr = features.compute_atr(
-                    h["high"], h["low"], h["close"], cfg.atr_period
-                )
-                cash, _ = self._apply_decision(
-                    dt_key, code, close, score, atr, cash, positions, trades
-                )
+                h["turnover"].append(turnover_usd)
+                h["turnover_rate"].append(turnover_rate)
+                h["main_flow"].append(main_flow)
 
             equity_curve.append(cash + self._holdings_value(positions, all_data, dt))
+            if dt_key in bench:
+                bench_closes.append(bench[dt_key])
             if bench_closes:
                 benchmark_curve.append(
                     self._initial_cash * bench_closes[-1] / bench_closes[0]
@@ -286,14 +308,14 @@ class BacktestEngine:
             self._initial_cash, cash, trades, equity_curve, benchmark_curve
         )
 
-    def _score(
-        self, turnover_rate, turnover_usd, main_flow, h, bench_closes, weights
-    ) -> float:
+    def _score(self, code, h, bench_closes, weights) -> float:
         cfg = self._cfg
+        turnover_rate = h["turnover_rate"][-1]
+        turnover_usd = h["turnover"][-1]
+        main_flow = h["main_flow"][-1]
+        warn, danger = self._turnover_thresholds(code)
         scores = {
-            "turnover": features.turnover_score(
-                turnover_rate, cfg.turnover_warning, cfg.turnover_danger
-            ),
+            "turnover": features.turnover_score(turnover_rate, warn, danger),
             "capital": features.capital_flow_score(main_flow, turnover_usd),
         }
         closes = h["close"]
@@ -314,11 +336,12 @@ class BacktestEngine:
         return features.score_from_features(scores, weights)
 
     def _apply_decision(
-        self, dt, code, close, score, atr, cash, positions, trades
+        self, dt, code, close, score, atr, turnover_usd, cash, positions, trades
     ) -> tuple[float, bool]:
         cfg = self._cfg
         in_pos = code in positions
         tranches = positions[code]["tranches"] if in_pos else 0
+        can_exit = in_pos and self._can_exit(positions[code], dt)
 
         # 浮动止损优先
         if in_pos and cfg.use_trailing_stop:
@@ -326,21 +349,32 @@ class BacktestEngine:
             peak = pos.get("peak", pos["avg"])
             if close > peak:
                 pos["peak"] = peak = close
-            if peak > 0 and (peak - close) / peak >= cfg.trailing_stop_pct:
+            if (
+                can_exit
+                and peak > 0
+                and (peak - close) / peak >= cfg.trailing_stop_pct
+            ):
                 return self._exit(dt, code, close, cash, positions, trades), True
 
         # 固定止损
-        if in_pos:
+        if in_pos and can_exit:
             avg = positions[code]["avg"]
             if avg > 0 and (avg - close) / avg >= cfg.stop_loss_pct:
                 return self._exit(dt, code, close, cash, positions, trades), True
 
         # 出货
-        if in_pos and score >= cfg.sell_threshold:
+        if in_pos and can_exit and score >= cfg.sell_threshold:
             return self._exit(dt, code, close, cash, positions, trades), True
 
         # 买入（含加仓）
-        if score < cfg.buy_threshold and tranches < cfg.entry_tranches:
+        can_open = in_pos or len(positions) < cfg.max_positions
+        liquidity_ok = turnover_usd >= cfg.min_daily_turnover_usd
+        if (
+            score < cfg.buy_threshold
+            and tranches < cfg.entry_tranches
+            and liquidity_ok
+            and can_open
+        ):
             if cfg.use_atr_sizing and atr and atr > 0:
                 net = cash  # 回测以现金近似可用净值
                 sized = features.atr_position_size(
@@ -366,9 +400,23 @@ class BacktestEngine:
                         "total_cost": cost,
                         "tranches": 1,
                         "peak": close,
+                        "buy_date": _to_date(dt),
                     }
                 trades.append(TradeRecord(dt, code, "BUY", close, qty, comm))
         return cash, False
+
+    def _can_exit(self, position: dict, dt: str) -> bool:
+        if self._cfg.min_hold_days <= 0:
+            return True
+        buy_date = position.get("buy_date")
+        if not isinstance(buy_date, date):
+            return True
+        return _trading_days_between(buy_date, _to_date(dt)) >= self._cfg.min_hold_days
+
+    def _turnover_thresholds(self, code: str) -> tuple[float, float]:
+        if code in self._listing_dates:
+            return self._cfg.turnover_warning, self._cfg.turnover_danger
+        return self._cfg.general_turnover_warning, self._cfg.general_turnover_danger
 
     def _exit(self, dt, code, close, cash, positions, trades) -> float:
         pos = positions.pop(code)
@@ -427,3 +475,7 @@ def _close_at(df: pd.DataFrame, dt, code: str) -> float | None:
     if rows.empty:
         return None
     return float(cast("pd.Series", rows["close"]).iloc[0])
+
+
+def _to_date(value) -> date:
+    return date.fromisoformat(str(value)[:10])

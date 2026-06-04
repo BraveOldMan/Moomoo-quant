@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """观察列表加载单测（WATCHLIST 环境变量优先 + watchlist.txt 回退，无需 OpenD）。"""
 
-from 新股策略.config import _load_watchlist
+from us_strategy.config import _load_watchlist
 
 
 def test_env_takes_precedence_over_file(tmp_path, monkeypatch):

@@ -30,7 +30,7 @@ class AlertManager:
     def _send_email(self, subject: str, body: str) -> None:
         cfg = self._cfg
         msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = f"[新股策略] {subject}"
+        msg["Subject"] = f"[us_strategy] {subject}"
         msg["From"] = cfg.alert_smtp_user
         msg["To"] = cfg.alert_email
         try:

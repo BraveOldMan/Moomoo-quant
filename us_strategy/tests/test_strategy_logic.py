@@ -4,8 +4,8 @@
 import dataclasses
 from datetime import date
 
-from 新股策略.config import StrategyConfig
-from 新股策略.strategy import IPOStrategy, _trading_days_between
+from us_strategy.config import StrategyConfig
+from us_strategy.strategy import IPOStrategy, _trading_days_between
 
 
 def _strategy(**overrides) -> IPOStrategy:

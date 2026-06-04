@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 import moomoo as ft
 
 from . import features
+from .clock import market_date
 from .config import StrategyConfig
 from .data_access import DataAccess
 
@@ -79,8 +81,11 @@ class SignalCalculator:
             return None
         row = snap.iloc[0]
 
-        rate = _safe_float(row.get("turnover_rate"))
-        turnover_usd = _safe_float(row.get("turnover"))
+        rate = _safe_float_or_none(row.get("turnover_rate"))
+        turnover_usd = _safe_float_or_none(row.get("turnover"))
+        if turnover_usd is None:
+            logger.warning("成交额字段缺失或非法，跳过 %s", code)
+            return None
         if last_price is None:
             last_price = _safe_float(row.get("last_price")) or None
         liquidity_ok = turnover_usd >= cfg.min_daily_turnover_usd
@@ -90,7 +95,8 @@ class SignalCalculator:
 
         # ── 换手率（核心，按标的自动分 IPO/成熟股 profile）──────────
         warn, danger = self._turnover_thresholds(code)
-        scores["turnover"] = features.turnover_score(rate, warn, danger)
+        if rate is not None:
+            scores["turnover"] = features.turnover_score(rate, warn, danger)
 
         # ── 机构资金分布（核心；美股可能不可用，缺失则降级）──────────
         out_ratio = self._capital_out_ratio(code)
@@ -235,8 +241,9 @@ class SignalCalculator:
     def _daily_kline(self, code: str):
         cfg = self._cfg
         bars = max(cfg.momentum_bars, cfg.atr_period + 1, cfg.rs_lookback_days + 1)
-        end = date.today().isoformat()
-        start = (date.today() - timedelta(days=bars * 3 + 10)).isoformat()
+        today = market_date(cfg.market_timezone)
+        end = today.isoformat()
+        start = (today - timedelta(days=bars * 3 + 10)).isoformat()
         try:
             ret, df, _ = self._data.request_history_kline(
                 code, start=start, end=end, ktype=ft.KLType.K_DAY, max_count=bars
@@ -292,7 +299,7 @@ class SignalCalculator:
         return stock_ret, bench_ret
 
     def _intraday_minute(self, code: str):
-        today = date.today().isoformat()
+        today = market_date(self._cfg.market_timezone).isoformat()
         try:
             ret, df, _ = self._data.request_history_kline(
                 code, start=today, end=today, ktype=ft.KLType.K_1M, max_count=400
@@ -336,7 +343,7 @@ class SignalCalculator:
         # 数据新鲜度门控：仅在最新一笔属于今日时有效（盘后会返回上一交易日尾盘）
         try:
             last_time = str(df["time"].iloc[-1])[:10]
-            if last_time != date.today().isoformat():
+            if last_time != market_date(self._cfg.market_timezone).isoformat():
                 logger.debug("逐笔数据非当日(%s)，order_flow 跳过 %s", last_time, code)
                 return None
         except (KeyError, IndexError):
@@ -539,15 +546,26 @@ class SignalCalculator:
             return False
         cfg = self._cfg
         lockup_expiry = listing + timedelta(days=cfg.lockup_days)
-        days_to_expiry = (lockup_expiry - date.today()).days
+        days_to_expiry = (
+            lockup_expiry - market_date(self._cfg.market_timezone)
+        ).days
         return 0 <= days_to_expiry <= cfg.lockup_warning_days
 
 
 def _safe_float(value) -> float:
     try:
-        return float(value or 0)
+        result = float(value or 0)
     except (TypeError, ValueError):
         return 0.0
+    return result if math.isfinite(result) else 0.0
+
+
+def _safe_float_or_none(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def _sum_book_size(levels, n: int) -> float:

@@ -47,6 +47,7 @@ class StrategyConfig:
     port: int = 11111
     trade_password: str = ""
     trd_env: str = "SIMULATE"  # "SIMULATE" 或 "REAL"
+    allow_real_trading: bool = False  # REAL 模式额外防护开关，须 ALLOW_REAL_TRADING=yes
 
     # ── IPO 扫描 ────────────────────────────────────────────────────────
     ipo_days_window: int = 10  # 只关注上市后 N 天内的新股
@@ -188,7 +189,7 @@ class StrategyConfig:
     backtest_benchmark: str = "US.SPY"  # 回测基准
 
     # ── 持久化 ──────────────────────────────────────────────────────────
-    db_path: str = "新股策略/positions.db"
+    db_path: str = "us_strategy/positions.db"
 
     # ── 告警通知 ────────────────────────────────────────────────────────
     alert_email: str = ""  # 收件人，空字符串表示不发邮件
@@ -209,6 +210,8 @@ class StrategyConfig:
             port=int(os.environ.get("OPEND_PORT", "11111")),
             trade_password=os.environ.get("TRADE_PASSWORD", ""),
             trd_env=os.environ.get("TRADE_ENV", "SIMULATE"),
+            allow_real_trading=os.environ.get("ALLOW_REAL_TRADING", "").lower()
+            in ("yes", "true", "1"),
             ipo_days_window=int(os.environ.get("IPO_DAYS_WINDOW", "10")),
             watchlist=_load_watchlist(),
             general_turnover_warning=float(
@@ -245,7 +248,7 @@ class StrategyConfig:
             use_short_metrics=_bool("USE_SHORT_METRICS", False),
             short_squeeze_reverse=_bool("SHORT_SQUEEZE_REVERSE", False),
             use_option_iv=_bool("USE_OPTION_IV", False),
-            db_path=os.environ.get("DB_PATH", "新股策略/positions.db"),
+            db_path=os.environ.get("DB_PATH", "us_strategy/positions.db"),
             alert_email=os.environ.get("ALERT_EMAIL", ""),
             alert_smtp_host=os.environ.get("SMTP_HOST", "smtp.gmail.com"),
             alert_smtp_port=int(os.environ.get("SMTP_PORT", "587")),

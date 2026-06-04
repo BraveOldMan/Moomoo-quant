@@ -3,8 +3,8 @@
 
 from datetime import date
 
-from 新股策略.config import StrategyConfig
-from 新股策略.signals import SignalCalculator
+from us_strategy.config import StrategyConfig
+from us_strategy.signals import SignalCalculator
 
 
 def _make_calc(cfg: StrategyConfig) -> SignalCalculator:
@@ -62,7 +62,7 @@ def test_fetch_recent_ipos_parses_list_time_column():
 
     from datetime import timedelta
 
-    from 新股策略.main import _fetch_recent_ipos
+    from us_strategy.main import _fetch_recent_ipos
 
     today = date.today()
     df = pd.DataFrame(
@@ -85,7 +85,7 @@ def test_fetch_recent_ipos_parses_list_time_column():
     class _FakeData:
         _quote = _FakeQuote()
 
-    result = _fetch_recent_ipos(_FakeData(), markets=("US",), days=10)
+    result = _fetch_recent_ipos(_FakeData(), markets=("US",), days=10, today=today)
 
     # 只保留近 10 天内"已上市"的 US.NEW；排除过期 US.OLD 与未上市 US.FUTURE
     assert result == {"US.NEW": today}

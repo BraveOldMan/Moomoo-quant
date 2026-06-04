@@ -12,10 +12,13 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 
 def _clamp(x: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    if not math.isfinite(x):
+        return (lo + hi) / 2.0
     return max(lo, min(hi, x))
 
 
@@ -202,7 +205,16 @@ def score_from_features(scores: dict[str, float], weights: dict[str, float]) -> 
     缺失因子（不在 scores 中）自动剔除并重新归一化，避免某因子在美股
     取不到数据时整体评分被零权重污染。
     """
-    usable = {k: weights[k] for k in scores if k in weights and weights[k] > 0}
+    usable = {
+        k: weights[k]
+        for k in scores
+        if (
+            k in weights
+            and weights[k] > 0
+            and math.isfinite(weights[k])
+            and math.isfinite(scores[k])
+        )
+    }
     total_w = sum(usable.values())
     if total_w <= 0:
         return 50.0
@@ -242,10 +254,10 @@ def compute_vwap(
         return None
     pv = 0.0
     vol = 0.0
-    for h, l, c, v in zip(highs, lows, closes, volumes):
-        typical = (h + l + c) / 3.0
-        pv += typical * v
-        vol += v
+    for high, low, close, volume in zip(highs, lows, closes, volumes):
+        typical = (high + low + close) / 3.0
+        pv += typical * volume
+        vol += volume
     if vol <= 0:
         return None
     return pv / vol

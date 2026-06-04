@@ -1,6 +1,6 @@
 # 新股 IPO 策略 — 检查与升级存档
 
-> 日期：2026-06-03 · 范围：`新股策略/` 全量重构升级
+> 日期：2026-06-03 · 范围：`us_strategy/` 全量重构升级
 > 验证：`py_compile` 全通过 · `pytest` 55 项全绿 · 全模块导入正常
 
 本文档归档一次完整的策略代码检查（review）与升级（upgrade）结论，作为后续迭代的基线参考。
@@ -13,7 +13,7 @@
 
 **核心隐忧**：策略有效性高度依赖两个数据字段——`turnover_rate`（换手率）与 `get_capital_distribution`（机构资金分布，原权重最高 0.55）。这两个接口在 **moomoo 美股**上的可得性/质量存疑（资金分布、经纪队列类接口主要面向港股/A 股）。若美股返回空，旧逻辑会 `return None` 整只跳过 → 策略实际永不产生信号。
 
-> ⚠️ **上线前第一优先级**：运行 `python -m 新股策略.probe US.XXX` 实测核心因子可得性。
+> ⚠️ **上线前第一优先级**：运行 `python -m us_strategy.probe US.XXX` 实测核心因子可得性。
 
 ---
 
@@ -78,7 +78,7 @@
 
 ## 五、上线前 checklist
 
-1. `python -m 新股策略.probe US.RDDT US.ARM` —— 确认核心因子可得性。
+1. `python -m us_strategy.probe US.RDDT US.ARM` —— 确认核心因子可得性。
 2. `FactorAnalyzer.factor_ic(codes, start, end)` —— 校准因子，剔除 IC 不显著者。
 3. `BacktestEngine.run_walk_forward(...)` —— 样本外验证 Sharpe / Calmar / Alpha。
 4. 据回测结果调整 `config.py` 权重与阈值，再启用相应因子开关。
@@ -103,7 +103,7 @@
 | `persistence.py` | SQLite 持仓恢复（含 qty） |
 | `market_calendar.py` | NYSE 假日表 |
 | `monitor.py` / `alerts.py` | 实时行情订阅 / 多渠道告警 |
-| `tests/` | 68 项纯逻辑单测（v1.0 起 55 → v1.2 增至 68） |
+| `tests/` | 82 项纯逻辑单测（v1.0 起 55 → v1.2 增至 68 → v1.2.2 增至 82） |
 
 ---
 
@@ -136,20 +136,36 @@
 
 > 日期：2026-06-03 · 验证：`pytest` 68 项全绿 · 已对成熟股 `US.AAPL` 冒烟通过
 
-信号引擎本就 symbol-agnostic；IPO 耦合仅在 universe 构建、锁定期因子、换手率阈值三处。本次解耦，**完全向后兼容**（自选清单默认空 → 行为与 v1.1 一致）。
+信号引擎本就 symbol-agnostic；IPO 耦合仅在 universe 构建、锁定期因子、换手率阈值三处。本次解耦，**完全向后兼容**：未配置自选清单时可仅 IPO；当前仓库自带 `watchlist.txt`，因此默认运行会纳入该文件中的美股。
 
 | 维度 | 实现 |
 |---|---|
 | **Universe** | 保留 IPO 扫描；新增自选清单 `watchlist`（环境变量 `WATCHLIST=US.AAPL,US.TSLA`）。运行时 universe = IPO扫描 ∪ 自选清单 ∪ 现有持仓 |
 | **换手率阈值** | 按标的**自动分 profile**（`signals._turnover_thresholds`）：近期 IPO 走高阈值 `80/150`，成熟股走 `general_turnover_warning/danger=5/15`。解决"成熟股 ~3% 换手被 IPO 阈值误判为零风险" |
 | **锁定期因子** | 非 IPO 标的无上市日 → 自动 no-op（原逻辑已支持） |
-| **包名** | 保留「新股策略」，仅泛化行为与文档，零迁移风险 |
+| **包名** | 保留「us_strategy」，仅泛化行为与文档，零迁移风险 |
 
 ### 用法
 ```bash
-python -m 新股策略.main                                   # 仅 IPO（与历史一致）
-WATCHLIST=US.AAPL,US.TSLA,US.NVDA python -m 新股策略.main  # IPO + 任意美股
+python -m us_strategy.main                                   # 自动加载 watchlist.txt + IPO
+WATCHLIST=US.AAPL,US.TSLA,US.NVDA python -m us_strategy.main  # IPO + 任意美股
 ```
 
 ### 测试增量
-`tests/test_features.py` +11（新因子纯函数）、`tests/test_universe_profile.py` +4（profile 选择 + watchlist 解析）。当前共 **68 项**全绿。
+`tests/test_features.py` +11（新因子纯函数）、`tests/test_universe_profile.py` +4（profile 选择 + watchlist 解析）。该版本当时共 **68 项**全绿。
+
+---
+
+## 九、v1.2.2 修复 — 时区、回测门禁与成交确认
+
+> 日期：2026-06-04 · 验证：`pytest` 82 项全绿 · `ruff check us_strategy` 通过
+
+本次修复一次全面审计中发现的实盘/回测风险点：
+
+1. **市场日统一**：新增 `clock.py`，策略状态、PDT、锁定期、日内 K 线和 IPO 扫描统一使用纽约市场日，避免中国时区午夜后美股仍交易时日期错位。
+2. **订单确认 fail-closed**：`place_order` 成功但缺少 `order_id` 时不再乐观记为全额成交，避免假持仓。
+3. **回测去未来函数**：回测信号只使用上一交易日及以前的历史窗口，当天价格仅作为执行/估值价。
+4. **回测补实盘约束**：加入流动性过滤、`max_positions`、最小持仓交易日和 IPO/成熟股换手率 profile。
+5. **数据质量门禁**：核心行情字段缺失或 NaN 不再静默转成低风险分；组合评分会剔除非有限值。
+6. **订阅释放完整**：启用 `TICKER/ORDER_BOOK` 时，取消订阅会释放全部订阅类型。
+7. **静态检查**：修复 `ruff E741` 变量名问题。

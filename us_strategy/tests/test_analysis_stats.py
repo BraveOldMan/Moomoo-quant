@@ -3,7 +3,7 @@
 
 import pytest
 
-from 新股策略.analysis import (
+from us_strategy.analysis import (
     information_coefficient,
     quantile_returns,
     summarize_ic,

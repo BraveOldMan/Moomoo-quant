@@ -194,7 +194,8 @@ class Trader:
     ) -> tuple[float, int]:
         """轮询订单直至成交/超时。返回 (成交均价, 已成交数量)。"""
         if not order_id:
-            return fallback_price, want_qty  # 无单号，乐观回退
+            logger.error("下单返回缺少 order_id，无法确认成交，按未成交处理")
+            return 0.0, 0
         deadline = time.monotonic() + self._cfg.order_fill_timeout_s
         last_price, last_filled = fallback_price, 0
         while time.monotonic() < deadline:

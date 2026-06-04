@@ -40,7 +40,7 @@ class RealtimeMonitor:
         self._ctx = quote_ctx
         self._callback = callback
         # QUOTE 必订；微观结构因子（CVD/OBI）启用时追加 TICKER/ORDER_BOOK
-        self._sub_types = [ft.SubType.QUOTE, *(extra_sub_types or [])]
+        self._sub_types = list(dict.fromkeys([ft.SubType.QUOTE, *(extra_sub_types or [])]))
         self._subscribed: set[str] = set()
         self._lock = threading.Lock()
 
@@ -65,7 +65,7 @@ class RealtimeMonitor:
         targets = [c for c in codes if c in self._subscribed]
         if not targets:
             return
-        ret, msg = self._ctx.unsubscribe(targets, [ft.SubType.QUOTE])
+        ret, msg = self._ctx.unsubscribe(targets, self._sub_types)
         if ret != ft.RET_OK:
             logger.error("取消订阅失败 %s: %s", targets, msg)
             return

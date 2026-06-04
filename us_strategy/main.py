@@ -11,6 +11,7 @@
 环境变量（均可选，有默认值）：
   OPEND_HOST / OPEND_PORT          OpenD 地址与端口
   TRADE_ENV                        SIMULATE（默认）或 REAL
+  ALLOW_REAL_TRADING               实盘二次确认开关，REAL 模式须设为 yes 否则拒绝启动
   TRADE_PASSWORD                   实盘解锁密码（REAL 必填）
   IPO_DAYS_WINDOW                  关注上市后 N 天内新股，默认 10
   POSITION_RATIO / MAX_POSITIONS / ENTRY_TRANCHES   仓位参数
@@ -28,11 +29,11 @@ import queue
 import threading
 import time
 from datetime import date, datetime, time as _time, timedelta
-from zoneinfo import ZoneInfo
 
 import moomoo as ft
 
 from .alerts import AlertManager
+from .clock import market_date, market_datetime
 from .config import Signal, StrategyConfig
 from .data_access import DataAccess
 from .market_calendar import get_nyse_holidays
@@ -52,9 +53,9 @@ _IPO_REFRESH_INTERVAL = 300  # 每 5 分钟刷新一次 IPO 列表
 _SHUTDOWN = object()  # 队列哨兵
 
 
-def _is_market_open(cfg: StrategyConfig) -> bool:
-    tz = ZoneInfo(cfg.market_timezone)
-    now = datetime.now(tz)
+def _is_market_open(cfg: StrategyConfig, now: datetime | None = None) -> bool:
+    """按配置市场时区判断常规交易时段。"""
+    now = market_datetime(cfg.market_timezone, now=now)
     today = now.date()
     if today.weekday() >= 5:
         return False
@@ -66,17 +67,24 @@ def _is_market_open(cfg: StrategyConfig) -> bool:
     return _time(open_h, open_m) <= t < _time(close_h, close_m)
 
 
-def _is_in_open_cooldown(cfg: StrategyConfig) -> bool:
-    tz = ZoneInfo(cfg.market_timezone)
-    now = datetime.now(tz)
+def _is_in_open_cooldown(cfg: StrategyConfig, now: datetime | None = None) -> bool:
+    """按市场时区判断是否仍处于开盘冷静期。"""
+    now = market_datetime(cfg.market_timezone, now=now)
     open_h, open_m = map(int, cfg.market_open.split(":"))
     market_open_dt = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     elapsed = (now - market_open_dt).total_seconds() / 60.0
     return 0.0 <= elapsed < cfg.open_cooldown_minutes
 
 
-def _fetch_recent_ipos(data: DataAccess, markets: tuple, days: int) -> dict[str, date]:
-    cutoff = date.today() - timedelta(days=days)
+def _fetch_recent_ipos(
+    data: DataAccess,
+    markets: tuple,
+    days: int,
+    today: date | None = None,
+) -> dict[str, date]:
+    """获取近 N 个自然日内已经上市的新股，日期按市场日传入。"""
+    today = today or market_date(StrategyConfig.market_timezone)
+    cutoff = today - timedelta(days=days)
     result: dict[str, date] = {}
     for market in markets:
         # 显式用 ft.Market 枚举（文档约定）；字符串无对应枚举时回退原值
@@ -100,7 +108,6 @@ def _fetch_recent_ipos(data: DataAccess, markets: tuple, days: int) -> dict[str,
         if date_col is None or code_col is None:
             logger.warning("IPO 列表列名未识别 cols=%s", df.columns.tolist())
             continue
-        today = date.today()
         for _, row in df.iterrows():
             try:
                 listing_date = date.fromisoformat(str(row[date_col])[:10])
@@ -131,8 +138,14 @@ def _get_snapshot(data: DataAccess, code: str) -> tuple[float | None, int]:
 
 def run() -> None:
     cfg = StrategyConfig.from_env()
-    if cfg.trd_env == "REAL" and not cfg.trade_password:
-        raise RuntimeError("实盘模式必须设置 TRADE_PASSWORD 环境变量")
+    if cfg.trd_env == "REAL":
+        if not cfg.allow_real_trading:
+            raise RuntimeError(
+                "拒绝启动实盘：TRADE_ENV=REAL 时必须显式设置 ALLOW_REAL_TRADING=yes 作为二次确认。"
+                "如需模拟交易请不要设置 TRADE_ENV（默认 SIMULATE）。"
+            )
+        if not cfg.trade_password:
+            raise RuntimeError("实盘模式必须设置 TRADE_PASSWORD 环境变量")
 
     quote_ctx = ft.OpenQuoteContext(host=cfg.host, port=cfg.port)
     trade_ctx = ft.OpenSecTradeContext(
@@ -178,7 +191,7 @@ def run() -> None:
             return
 
         # 每个交易日开盘后首次：注入熔断基准净值
-        today = date.today()
+        today = market_date(cfg.market_timezone)
         if baseline_set_date.get("d") != today:
             pv = trader.get_portfolio_value()
             if pv > 0:
@@ -203,7 +216,7 @@ def run() -> None:
                     PositionRecord(
                         code=code,
                         cost_price=strategy.get_avg_cost(code),
-                        buy_date=date.today(),
+                        buy_date=market_date(cfg.market_timezone),
                         tranches_bought=strategy.get_tranches_bought(code),
                         peak_price=strategy.get_peak_price(code),
                         qty=strategy.get_qty(code),
@@ -272,7 +285,12 @@ def run() -> None:
                         f"当日亏损超过 {cfg.daily_loss_limit_pct * 100:.0f}%，暂停买入直到次日",
                     )
 
-            ipo_map = _fetch_recent_ipos(data, cfg.markets, cfg.ipo_days_window)
+            ipo_map = _fetch_recent_ipos(
+                data,
+                cfg.markets,
+                cfg.ipo_days_window,
+                today=market_date(cfg.market_timezone),
+            )
             if ipo_map:
                 calculator.set_listing_dates(ipo_map)
                 monitor.subscribe(list(ipo_map.keys()))

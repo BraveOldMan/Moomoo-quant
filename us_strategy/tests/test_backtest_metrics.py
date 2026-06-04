@@ -3,7 +3,7 @@
 
 import pytest
 
-from 新股策略.backtest import BacktestResult
+from us_strategy.backtest import BacktestResult
 
 
 def _result(curve, bench=None, final=None):
@@ -44,7 +44,7 @@ def test_sharpe_positive_for_upward_curve():
 
 
 def test_win_rate():
-    from 新股策略.backtest import TradeRecord
+    from us_strategy.backtest import TradeRecord
 
     r = BacktestResult(
         initial_cash=100,

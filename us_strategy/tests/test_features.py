@@ -3,7 +3,7 @@
 
 import pytest
 
-from 新股策略 import features as F
+from us_strategy import features as F
 
 
 # ── 单因子评分边界与单调性 ──────────────────────────────────────────────
