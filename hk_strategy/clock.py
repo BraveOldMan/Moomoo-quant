@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """市场时区日期工具。
 
-美股策略运行在中国机器上时，必须按纽约市场日判断交易日、PDT 和日内数据。
+港股策略运行时按香港市场日（Asia/Hong_Kong）判断交易日与日内数据；
+本工具与市场无关，接受任意时区名。
 """
 
 from datetime import date, datetime

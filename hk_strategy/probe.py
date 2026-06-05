@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """数据可得性探针。
 
-策略有效性高度依赖少数几个字段在 **美股** 上的可得性，尤其：
+策略有效性高度依赖少数几个字段在 **港股** 上的可得性，尤其：
   - get_market_snapshot 的 turnover_rate / turnover（换手率因子，权重高）
-  - get_capital_distribution（机构资金分布，核心因子，权重最高）
-  - get_broker_queue（经纪队列，美股通常不可用）
+  - get_capital_distribution（机构资金分布，核心因子，权重最高；港股通常可用）
+  - get_broker_queue（经纪队列，港股可用但须先订阅 Broker 数据）
 
-本脚本连 OpenD 实测上述接口对给定美股的返回，输出每个核心因子能否落地，
+本脚本连 OpenD 实测上述接口对给定港股的返回，输出每个核心因子能否落地，
 帮助在上线前确认策略是否成立（而非空跑）。
 
 用法：
@@ -45,7 +45,7 @@ def _check_snapshot(quote_ctx, code: str) -> dict:
 def _check_capital_distribution(quote_ctx, code: str) -> dict:
     try:
         ret, df = quote_ctx.get_capital_distribution(code)
-    except Exception as exc:  # 美股可能直接抛接口不支持
+    except Exception as exc:  # 接口不支持时可能直接抛异常
         return {"ok": False, "detail": f"异常: {exc}"}
     if ret != ft.RET_OK or df.empty:
         return {"ok": False, "detail": str(df)}
@@ -213,7 +213,7 @@ def probe(codes: list[str]) -> None:
 
             bq = _check_broker_queue(quote_ctx, code)
             print(
-                f"[broker_queue]         {_status(bq['ok'])}  (美股通常不可用，默认关闭)"
+                f"[broker_queue]         {_status(bq['ok'])}  (港股可用，但须先订阅 Broker 数据)"
             )
             if not bq["ok"]:
                 print(f"  {bq['detail']}")

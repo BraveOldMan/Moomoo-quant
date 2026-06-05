@@ -98,7 +98,7 @@ class SignalCalculator:
         if rate is not None:
             scores["turnover"] = features.turnover_score(rate, warn, danger)
 
-        # ── 机构资金分布（核心；美股可能不可用，缺失则降级）──────────
+        # ── 机构资金分布（核心；港股通常可用，缺失则降级）────────────
         out_ratio = self._capital_out_ratio(code)
         if out_ratio is not None:
             scores["capital"] = features.capital_outflow_score(
@@ -136,7 +136,7 @@ class SignalCalculator:
                         scores["vwap"] = features.vwap_score(last_price, vwap)
                         extra["vwap"] = vwap
 
-        # ── 经纪队列（美股一般不可用，默认关闭）────────────────────
+        # ── 经纪队列（港股可用但须订阅 Broker 数据，默认关闭）────────
         if cfg.use_broker_signal:
             ask_ratio = self._broker_ask_ratio(code)
             if ask_ratio is not None:
@@ -210,7 +210,7 @@ class SignalCalculator:
         """按标的选换手率阈值 profile。
 
         近期 IPO（在 set_listing_dates 注入的清单中）用 IPO 高换手阈值；
-        其余美股（自选/持仓中的成熟股）用成熟股低换手阈值，避免成熟股
+        其余港股（自选/持仓中的成熟股）用成熟股低换手阈值，避免成熟股
         的正常低换手被 IPO 阈值误判为"流动性极低/零风险"。
         """
         cfg = self._cfg

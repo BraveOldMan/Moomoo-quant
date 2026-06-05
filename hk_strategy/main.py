@@ -106,7 +106,7 @@ def _fetch_recent_ipos(
             if ret != ft.RET_OK:
                 logger.warning("get_ipo_list 失败 market=%s: %s", market, df)
             continue
-        # moomoo get_ipo_list 的上市日列名为 list_time（美股为预计上市日）；
+        # moomoo get_ipo_list 的上市日列名为 list_time（港股为预计上市日）；
         # 保留 listing/ipo_date 模糊匹配作兜底，防 SDK 版本差异。
         date_col = next(
             (
@@ -291,7 +291,7 @@ def run() -> None:
     monitor.start()
     if saved:
         monitor.subscribe(list(saved.keys()))
-    # 自选 universe（非 IPO 的通用美股）：启动即订阅，全程纳入分析
+    # 自选 universe（非 IPO 的通用港股）：启动即订阅，全程纳入分析
     if cfg.watchlist:
         monitor.subscribe(list(cfg.watchlist))
         logger.info("自选 universe %d 只: %s", len(cfg.watchlist), list(cfg.watchlist))

@@ -102,7 +102,7 @@ def order_flow_score(buy_vol: float, sell_vol: float) -> float:
 
     imbalance =(主动买 − 主动卖)/(主动买 + 主动卖)，∈[-1,1]。
     净主动买入（imbalance>0）→ 多头主导 → 低风险；净卖出→高风险。
-    数据来自 get_rt_ticker 的 ticker_direction(BUY/SELL)，是美股可用的
+    数据来自 get_rt_ticker 的 ticker_direction(BUY/SELL)，是港股可用的
     order-flow 信号，替代港股专用的 broker_queue。
     """
     total = buy_vol + sell_vol
@@ -156,7 +156,7 @@ def flow_trend_score(slope: float, turnover_usd: float) -> float:
 def short_volume_score(daily_short_pct: float) -> float:
     """每日卖空占比风险分：当日成交中卖空比例越高，抛压越大→高风险。
 
-    daily_short_pct 为百分数（如 13.6 表示 13.6%）。中枢约 15%（美股常见）。
+    daily_short_pct 为百分数（如 13.6 表示 13.6%）。中枢约 15%（经验值，需按港股校准）。
     """
     return _clamp(daily_short_pct * (50.0 / 15.0))
 
@@ -202,7 +202,7 @@ def pcr_score(put_oi: float, call_oi: float) -> float:
 def score_from_features(scores: dict[str, float], weights: dict[str, float]) -> float:
     """按"数据可用且权重>0"的因子做归一化加权。
 
-    缺失因子（不在 scores 中）自动剔除并重新归一化，避免某因子在美股
+    缺失因子（不在 scores 中）自动剔除并重新归一化，避免某因子在港股
     取不到数据时整体评分被零权重污染。
     """
     usable = {
