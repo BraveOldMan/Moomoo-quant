@@ -18,6 +18,7 @@ env/
 *.sqlite
 *.sqlite3
 us_strategy/positions.db
+hk_strategy/positions.db
 *.log
 
 # ── 第三方 SDK（通过 `pip install moomoo-api` 安装，不纳入版本库）──
