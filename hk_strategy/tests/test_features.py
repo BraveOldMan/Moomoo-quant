@@ -90,6 +90,13 @@ def test_order_flow_score_extremes_and_zero():
     assert F.order_flow_score(0, 0) == 50.0
 
 
+def test_hk_status_score_status_risk_levels():
+    assert F.hk_status_score(None, "NORMAL") == 50.0
+    assert F.hk_status_score("TRADING", "NORMAL") == 60.0
+    assert F.hk_status_score(None, "DARKTRADING") == 65.0
+    assert F.hk_status_score(None, "SUSPENDED") == 100.0
+
+
 def test_order_book_imbalance_score_bid_heavy_low_risk():
     bid_heavy = F.order_book_imbalance_score(bid_depth=800, ask_depth=200)
     ask_heavy = F.order_book_imbalance_score(bid_depth=200, ask_depth=800)

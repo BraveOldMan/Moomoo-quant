@@ -66,6 +66,15 @@ class OrderBookBatch:
     source: str
 
 
+@dataclass
+class PeriodicPoll:
+    """A low-frequency polling callback used during realtime collection."""
+
+    callback: Callable[[], None]
+    interval: float
+    next_due: float
+
+
 def utc_now() -> str:
     """Return the current UTC timestamp for run audit fields."""
 
@@ -113,6 +122,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--l2-imbalance-warn", type=float, default=0.35)
     parser.add_argument("--l2-imbalance-danger", type=float, default=0.60)
     parser.add_argument("--broker-queue-interval", type=float, default=60.0)
+    parser.add_argument("--quote-snapshot-interval", type=float, default=60.0)
+    parser.add_argument("--quote-snapshot-batch-size", type=int, default=200)
     parser.add_argument("--batch-size", type=int, default=500)
     parser.add_argument("--flush-interval", type=float, default=5.0)
     parser.add_argument("--subscribe-batch-size", type=int, default=50)
@@ -134,6 +145,12 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Collect HK realtime BROKER queue snapshots.",
+    )
+    parser.add_argument(
+        "--collect-quote-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Collect low-frequency get_market_snapshot rows.",
     )
     parser.add_argument(
         "--init-db-only",
@@ -619,6 +636,60 @@ def frame_to_records(
     return records
 
 
+def quote_snapshot_records(
+    frame: pd.DataFrame,
+    source: str,
+    run_id: str,
+) -> list[dict[str, Any]]:
+    """Convert get_market_snapshot rows into low-frequency quote snapshots."""
+
+    now = utc_now()
+    records: list[dict[str, Any]] = []
+    for row in _frame_records(frame):
+        code = str(row.get("code") or "")
+        if not code:
+            continue
+        try:
+            market = market_for_code(code)
+        except ValueError:
+            continue
+        payload = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+        records.append(
+            {
+                "snapshot_id": uuid.uuid4().hex,
+                "_code": code,
+                "market": market,
+                "trade_date": _trade_date_from_utc(now, market),
+                "snapshot_ts_utc": now,
+                "source": source,
+                "name": row.get("name"),
+                "last_price": _float_or_none(row.get("last_price")),
+                "cur_price": _float_or_none(row.get("cur_price")),
+                "bid_price": _float_or_none(row.get("bid_price")),
+                "ask_price": _float_or_none(row.get("ask_price")),
+                "bid_vol": _float_or_none(row.get("bid_vol")),
+                "ask_vol": _float_or_none(row.get("ask_vol")),
+                "volume": _float_or_none(row.get("volume")),
+                "turnover": _float_or_none(row.get("turnover")),
+                "turnover_rate": _float_or_none(row.get("turnover_rate")),
+                "open_price": _float_or_none(row.get("open_price")),
+                "high_price": _float_or_none(row.get("high_price")),
+                "low_price": _float_or_none(row.get("low_price")),
+                "prev_close_price": _float_or_none(row.get("prev_close_price")),
+                "market_status": row.get("market_status"),
+                "update_time": row.get("update_time"),
+                "lot_size": _float_or_none(row.get("lot_size")),
+                "price_spread": _float_or_none(row.get("price_spread")),
+                "dark_status": row.get("dark_status"),
+                "sec_status": row.get("sec_status"),
+                "_run_id": run_id,
+                "_fetched_at": now,
+                "_payload_json": payload,
+            }
+        )
+    return records
+
+
 def chunked(items: tuple[str, ...], size: int) -> Iterable[tuple[str, ...]]:
     """Yield fixed-size chunks."""
 
@@ -645,6 +716,7 @@ class TickStore:
         self.order_book_snapshots = 0
         self.order_book_levels = 0
         self.order_book_metric_rows = 0
+        self.quote_snapshots = 0
         self.broker_queue_snapshots = 0
         self.broker_queue_levels = 0
         self.broker_queue_metric_rows = 0
@@ -678,6 +750,7 @@ class TickStore:
                 order_book_snapshots INTEGER NOT NULL DEFAULT 0,
                 order_book_levels INTEGER NOT NULL DEFAULT 0,
                 order_book_metric_rows INTEGER NOT NULL DEFAULT 0,
+                quote_snapshots INTEGER NOT NULL DEFAULT 0,
                 broker_queue_snapshots INTEGER NOT NULL DEFAULT 0,
                 broker_queue_levels INTEGER NOT NULL DEFAULT 0,
                 broker_queue_metric_rows INTEGER NOT NULL DEFAULT 0,
@@ -696,6 +769,7 @@ class TickStore:
                 "order_book_snapshots": "INTEGER NOT NULL DEFAULT 0",
                 "order_book_levels": "INTEGER NOT NULL DEFAULT 0",
                 "order_book_metric_rows": "INTEGER NOT NULL DEFAULT 0",
+                "quote_snapshots": "INTEGER NOT NULL DEFAULT 0",
                 "broker_queue_snapshots": "INTEGER NOT NULL DEFAULT 0",
                 "broker_queue_levels": "INTEGER NOT NULL DEFAULT 0",
                 "broker_queue_metric_rows": "INTEGER NOT NULL DEFAULT 0",
@@ -920,6 +994,41 @@ class TickStore:
         )
         self.conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS realtime_quote_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                _code TEXT NOT NULL,
+                market TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                snapshot_ts_utc TEXT NOT NULL,
+                source TEXT NOT NULL,
+                name TEXT,
+                last_price REAL,
+                cur_price REAL,
+                bid_price REAL,
+                ask_price REAL,
+                bid_vol REAL,
+                ask_vol REAL,
+                volume REAL,
+                turnover REAL,
+                turnover_rate REAL,
+                open_price REAL,
+                high_price REAL,
+                low_price REAL,
+                prev_close_price REAL,
+                market_status TEXT,
+                update_time TEXT,
+                lot_size REAL,
+                price_spread REAL,
+                dark_status TEXT,
+                sec_status TEXT,
+                _run_id TEXT NOT NULL,
+                _fetched_at TEXT NOT NULL,
+                _payload_json TEXT NOT NULL
+            )
+            """
+        )
+        self.conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS realtime_ticks (
                 _code TEXT NOT NULL,
                 sequence TEXT NOT NULL,
@@ -1054,6 +1163,24 @@ class TickStore:
         )
         self.conn.execute(
             """
+            CREATE INDEX IF NOT EXISTS idx_realtime_quote_snapshots_code_time
+              ON realtime_quote_snapshots (_code, snapshot_ts_utc)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_realtime_quote_snapshots_market_time
+              ON realtime_quote_snapshots (market, snapshot_ts_utc)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_realtime_quote_snapshots_code_date
+              ON realtime_quote_snapshots (_code, trade_date)
+            """
+        )
+        self.conn.execute(
+            """
             CREATE INDEX IF NOT EXISTS idx_order_book_snapshots_code_time
               ON order_book_snapshots (_code, snapshot_ts_utc)
             """
@@ -1119,6 +1246,7 @@ class TickStore:
                        order_book_snapshots = ?,
                        order_book_levels = ?,
                        order_book_metric_rows = ?,
+                       quote_snapshots = ?,
                        broker_queue_snapshots = ?,
                        broker_queue_levels = ?,
                        broker_queue_metric_rows = ?,
@@ -1139,6 +1267,7 @@ class TickStore:
                     self.order_book_snapshots,
                     self.order_book_levels,
                     self.order_book_metric_rows,
+                    self.quote_snapshots,
                     self.broker_queue_snapshots,
                     self.broker_queue_levels,
                     self.broker_queue_metric_rows,
@@ -1214,6 +1343,52 @@ class TickStore:
             self.cache_rows += sum(1 for record in records if record["source"] == "cache")
             self.push_rows += sum(1 for record in records if record["source"] == "push")
         return changed
+
+    def insert_quote_snapshot_records(
+        self,
+        frame: pd.DataFrame,
+        source: str,
+    ) -> int:
+        """Persist low-frequency get_market_snapshot rows."""
+
+        records = quote_snapshot_records(frame, source, self.run_id)
+        if not records:
+            return 0
+        columns = (
+            "snapshot_id",
+            "_code",
+            "market",
+            "trade_date",
+            "snapshot_ts_utc",
+            "source",
+            "name",
+            "last_price",
+            "cur_price",
+            "bid_price",
+            "ask_price",
+            "bid_vol",
+            "ask_vol",
+            "volume",
+            "turnover",
+            "turnover_rate",
+            "open_price",
+            "high_price",
+            "low_price",
+            "prev_close_price",
+            "market_status",
+            "update_time",
+            "lot_size",
+            "price_spread",
+            "dark_status",
+            "sec_status",
+            "_run_id",
+            "_fetched_at",
+            "_payload_json",
+        )
+        with self.lock:
+            self._insert_or_replace("realtime_quote_snapshots", columns, records)
+            self.quote_snapshots += len(records)
+        return len(records)
 
     def insert_order_book_records(
         self,
@@ -2068,6 +2243,29 @@ def fetch_broker_queues(
     return total
 
 
+def fetch_quote_snapshots(
+    quote_ctx: ft.OpenQuoteContext,
+    store: TickStore,
+    codes: tuple[str, ...],
+    batch_size: int,
+    source: str,
+) -> int:
+    """Fetch and persist low-frequency market snapshots for selected codes."""
+
+    total = 0
+    for batch in chunked(codes, batch_size):
+        ret, data = quote_ctx.get_market_snapshot(list(batch))
+        if ret != ft.RET_OK:
+            store.log_error(",".join(batch), "get_market_snapshot", str(data))
+            continue
+        if not isinstance(data, pd.DataFrame) or data.empty:
+            continue
+        total += store.insert_quote_snapshot_records(data, source)
+    if total:
+        print(f"[quote_snapshot] rows={total} source={source}", flush=True)
+    return total
+
+
 def backfill_recent_cache(
     quote_ctx: ft.OpenQuoteContext,
     writer: TickWriter,
@@ -2118,28 +2316,35 @@ def fetch_initial_order_books(
 def wait_until_done(
     duration_seconds: int,
     stop_event: threading.Event,
-    poll_callback: Callable[[], None] | None = None,
-    poll_interval: float = 60.0,
+    poll_callbacks: Iterable[tuple[Callable[[], None], float]] | None = None,
 ) -> None:
     """Block until duration elapses, Ctrl-C is received, or task stop is requested."""
 
-    interval = max(1.0, float(poll_interval))
-    next_poll = time.monotonic() + interval
+    polls = [
+        PeriodicPoll(
+            callback=callback,
+            interval=max(1.0, float(interval)),
+            next_due=time.monotonic() + max(1.0, float(interval)),
+        )
+        for callback, interval in (poll_callbacks or ())
+    ]
+
+    def run_due_polls() -> None:
+        now = time.monotonic()
+        for poll in polls:
+            if now >= poll.next_due:
+                poll.callback()
+                poll.next_due = now + poll.interval
+
     if duration_seconds <= 0:
         while not stop_event.is_set():
-            now = time.monotonic()
-            if poll_callback is not None and now >= next_poll:
-                poll_callback()
-                next_poll = now + interval
+            run_due_polls()
             time.sleep(1)
         return
 
     deadline = time.monotonic() + duration_seconds
     while not stop_event.is_set() and time.monotonic() < deadline:
-        now = time.monotonic()
-        if poll_callback is not None and now >= next_poll:
-            poll_callback()
-            next_poll = now + interval
+        run_due_polls()
         time.sleep(1)
 
 
@@ -2147,7 +2352,12 @@ def main() -> int:
     """Collect realtime moomoo ticker rows into a local SQLite database."""
 
     args = parse_args()
-    if not args.collect_ticks and not args.collect_order_book and not args.collect_broker_queue:
+    if (
+        not args.collect_ticks
+        and not args.collect_order_book
+        and not args.collect_broker_queue
+        and not args.collect_quote_snapshots
+    ):
         raise ValueError("at least one realtime collection type is required")
     if args.init_db_only:
         store = TickStore(Path(args.db), uuid.uuid4().hex)
@@ -2159,6 +2369,10 @@ def main() -> int:
     markets = tuple(sorted({market_for_code(code) for code in codes}))
     configs = market_configs(args)
     collect_broker_queue = bool(args.collect_broker_queue and "HK" in markets)
+    collect_quote_snapshots = bool(args.collect_quote_snapshots)
+    needs_subscription = (
+        args.collect_ticks or args.collect_order_book or collect_broker_queue
+    )
     run_id = uuid.uuid4().hex
     store = TickStore(Path(args.db), run_id)
     writer = TickWriter(
@@ -2201,20 +2415,21 @@ def main() -> int:
                 OrderBookPushHandler(writer.enqueue_order_book, store.log_error)
             )
         quote_ctx.start()
-        subscribed = subscribe_codes(
-            quote_ctx,
-            store,
-            codes,
-            configs,
-            args.subscribe_batch_size,
-            args.collect_ticks,
-            args.collect_order_book,
-            collect_broker_queue,
-        )
-        if subscribed == 0:
-            status = "failed"
-            note = "no ticker subscriptions succeeded"
-            return 2
+        if needs_subscription:
+            subscribed = subscribe_codes(
+                quote_ctx,
+                store,
+                codes,
+                configs,
+                args.subscribe_batch_size,
+                args.collect_ticks,
+                args.collect_order_book,
+                collect_broker_queue,
+            )
+            if subscribed == 0:
+                status = "failed"
+                note = "no realtime subscriptions succeeded"
+                return 2
         if args.post_subscribe_wait > 0:
             time.sleep(args.post_subscribe_wait)
         if args.collect_ticks:
@@ -2229,15 +2444,39 @@ def main() -> int:
             )
         if collect_broker_queue:
             fetch_broker_queues(quote_ctx, store, codes, "cache")
+        if collect_quote_snapshots:
+            fetch_quote_snapshots(
+                quote_ctx,
+                store,
+                codes,
+                args.quote_snapshot_batch_size,
+                "cache",
+            )
+        poll_callbacks: list[tuple[Callable[[], None], float]] = []
+        if collect_broker_queue:
+            poll_callbacks.append(
+                (
+                    lambda: fetch_broker_queues(quote_ctx, store, codes, "poll"),
+                    args.broker_queue_interval,
+                )
+            )
+        if collect_quote_snapshots:
+            poll_callbacks.append(
+                (
+                    lambda: fetch_quote_snapshots(
+                        quote_ctx,
+                        store,
+                        codes,
+                        args.quote_snapshot_batch_size,
+                        "poll",
+                    ),
+                    args.quote_snapshot_interval,
+                )
+            )
         wait_until_done(
             args.duration_seconds,
             stop_event,
-            (
-                lambda: fetch_broker_queues(quote_ctx, store, codes, "poll")
-                if collect_broker_queue
-                else None
-            ),
-            args.broker_queue_interval,
+            poll_callbacks,
         )
     except Exception as exc:
         status = "failed"
@@ -2259,7 +2498,8 @@ def main() -> int:
         "finished "
         f"run_id={run_id} status={status} "
         f"tick_rows={store.rows_written} "
-        f"book_snapshots={store.order_book_snapshots}",
+        f"book_snapshots={store.order_book_snapshots} "
+        f"quote_snapshots={store.quote_snapshots}",
         flush=True,
     )
     return 0 if status == "success" else 2

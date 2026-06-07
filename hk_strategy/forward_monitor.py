@@ -51,6 +51,7 @@ def _enable_all_factors(cfg: StrategyConfig) -> StrategyConfig:
         use_order_book_pressure=True,
         use_order_book_metrics=True,
         use_l2_imbalance_tracker=True,
+        use_hk_status_signal=True,
         use_intraday_flow=True,
         use_lunch_continuation=True,
         use_short_metrics=True,

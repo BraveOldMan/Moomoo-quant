@@ -168,6 +168,22 @@ class SignalCalculator:
                     )
 
         # ── 盘中微观结构：CVD 主动买卖盘 / 盘口失衡 OBI ────────────────
+        if cfg.use_hk_status_signal:
+            dark_status = row.get("dark_status")
+            sec_status = row.get("sec_status")
+            scores["hk_status"] = features.hk_status_score(dark_status, sec_status)
+            extra["hk_status"] = {
+                "dark_status": dark_status,
+                "sec_status": sec_status,
+            }
+            if scores["hk_status"] >= 80.0:
+                risk_warnings.append(
+                    "HK status risk: "
+                    f"dark_status={dark_status} "
+                    f"sec_status={sec_status} "
+                    f"score={scores['hk_status']:.1f}"
+                )
+
         if cfg.use_order_flow:
             of = self._order_flow_imbalance(code)
             if of is not None:

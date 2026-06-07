@@ -1,8 +1,9 @@
 # tick_collect.ps1 - scheduled launcher for HK watchlist tick collection.
 #
 # Runs `python -m tools.collect_moomoo_ticks` for HK watchlist symbols and
-# stores realtime TICKER rows, L2 ORDER_BOOK snapshots, L2 imbalance,
-# large-print proxy events, alerts, and daily microstructure features.
+# stores realtime TICKER rows, low-frequency market snapshots, L2 ORDER_BOOK
+# snapshots, HK BROKER queue, L2 imbalance, large-print proxy events, alerts,
+# and daily microstructure features.
 #
 # Registered by: Register-ScheduledTask "MoomooHKTickCollect"
 #   Trigger : weekly Mon-Fri 09:15 (Beijing/HKT)
@@ -26,7 +27,7 @@ if (-not $conn.TcpTestSucceeded) {
 }
 
 Write-Log 'launching HK tick collector'
-& cmd /c "`"$py`" -u -m tools.collect_moomoo_ticks --markets HK --db us_strategy\history_data.db --hk-watchlist hk_strategy\watchlist.txt --duration-seconds 25200 --cache-num 1000 --batch-size 500 --flush-interval 5 --dark-pool-us-min-notional 100000 --dark-pool-hk-min-notional 800000 --l2-imbalance-level 10 --l2-imbalance-warn 0.35 --l2-imbalance-danger 0.60 >> `"$log`" 2>&1"
+& cmd /c "`"$py`" -u -m tools.collect_moomoo_ticks --markets HK --db us_strategy\history_data.db --hk-watchlist hk_strategy\watchlist.txt --duration-seconds 25200 --cache-num 1000 --batch-size 500 --flush-interval 5 --dark-pool-us-min-notional 100000 --dark-pool-hk-min-notional 800000 --l2-imbalance-level 10 --l2-imbalance-warn 0.35 --l2-imbalance-danger 0.60 --collect-broker-queue --broker-queue-interval 60 --collect-quote-snapshots --quote-snapshot-interval 60 --quote-snapshot-batch-size 200 >> `"$log`" 2>&1"
 $exitCode = $LASTEXITCODE
 Write-Log "HK tick collector exited (code=$exitCode)"
 

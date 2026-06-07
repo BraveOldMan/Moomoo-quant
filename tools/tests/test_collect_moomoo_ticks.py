@@ -107,6 +107,73 @@ def test_tick_store_upserts_duplicate_sequence(tmp_path) -> None:
         conn.close()
 
 
+def test_tick_store_persists_low_frequency_quote_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "ticks.db"
+    store = TickStore(db_path, "run-1")
+    store.start_run(("HK",), ("HK.00700",))
+    frame = pd.DataFrame(
+        [
+            {
+                "code": "HK.00700",
+                "name": "Tencent",
+                "last_price": 400.0,
+                "cur_price": 400.0,
+                "bid_price": 399.8,
+                "ask_price": 400.2,
+                "bid_vol": 1000,
+                "ask_vol": 1200,
+                "volume": 500_000,
+                "turnover": 200_000_000.0,
+                "turnover_rate": 0.5,
+                "market_status": "OPEN",
+                "update_time": "2026-06-05 10:00:00",
+                "dark_status": "TRADING",
+                "sec_status": "NORMAL",
+                "unexpected_field": "kept in payload",
+            }
+        ]
+    )
+
+    assert store.insert_quote_snapshot_records(frame, "poll") == 1
+    store.finish_run("success")
+    store.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT _code,
+                   market,
+                   last_price,
+                   bid_price,
+                   ask_price,
+                   turnover,
+                   market_status,
+                   dark_status,
+                   sec_status,
+                   _payload_json
+              FROM realtime_quote_snapshots
+            """
+        ).fetchone()
+        assert row[:9] == (
+            "HK.00700",
+            "HK",
+            400.0,
+            399.8,
+            400.2,
+            200_000_000.0,
+            "OPEN",
+            "TRADING",
+            "NORMAL",
+        )
+        assert "unexpected_field" in row[9]
+        assert conn.execute(
+            "SELECT quote_snapshots FROM tick_runs"
+        ).fetchone() == (1,)
+    finally:
+        conn.close()
+
+
 def test_tick_store_persists_order_book_snapshot(tmp_path) -> None:
     db_path = tmp_path / "ticks.db"
     store = TickStore(db_path, "run-1")
@@ -136,6 +203,112 @@ def test_tick_store_persists_order_book_snapshot(tmp_path) -> None:
         assert conn.execute(
             "SELECT order_book_snapshots, order_book_levels FROM tick_runs"
         ).fetchone() == (1, 4)
+    finally:
+        conn.close()
+
+
+def test_tick_store_persists_broker_queue_snapshot(tmp_path) -> None:
+    db_path = tmp_path / "ticks.db"
+    store = TickStore(db_path, "run-1")
+    store.start_run(("HK",), ("HK.00700",))
+    bid = pd.DataFrame(
+        [
+            {
+                "bid_broker_id": "B1",
+                "bid_broker_name": "Broker 1",
+                "bid_broker_pos": 1,
+                "order_id": "b1",
+                "order_volume": 1000,
+            }
+        ]
+    )
+    ask = pd.DataFrame(
+        [
+            {
+                "ask_broker_id": "A1",
+                "ask_broker_name": "Broker A",
+                "ask_broker_pos": 1,
+                "order_id": "a1",
+                "order_volume": 3000,
+            },
+            {
+                "ask_broker_id": "A2",
+                "ask_broker_name": "Broker B",
+                "ask_broker_pos": 2,
+                "order_id": "a2",
+                "order_volume": 1000,
+            },
+        ]
+    )
+
+    store.insert_broker_queue_records("HK.00700", bid, ask, "poll")
+    store.rebuild_microstructure_daily_features()
+    store.finish_run("success")
+    store.close()
+
+    conn = sqlite3.connect(db_path)
+    try:
+        assert (
+            conn.execute("SELECT COUNT(*) FROM broker_queue_snapshots").fetchone()[0]
+            == 1
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM broker_queue_levels").fetchone()[0]
+            == 3
+        )
+        assert (
+            conn.execute("SELECT COUNT(*) FROM broker_queue_metrics").fetchone()[0]
+            == 1
+        )
+
+        metric = conn.execute(
+            """
+            SELECT bid_count,
+                   ask_count,
+                   bid_order_volume,
+                   ask_order_volume,
+                   ask_ratio,
+                   ask_volume_share,
+                   score,
+                   ask_top_broker_id,
+                   ask_top_broker_volume,
+                   ask_top_broker_share
+              FROM broker_queue_metrics
+             WHERE _code = 'HK.00700'
+            """
+        ).fetchone()
+        assert metric[:4] == (1, 2, 1000.0, 4000.0)
+        assert metric[4] == pytest.approx(2 / 3)
+        assert metric[5] == pytest.approx(0.8)
+        assert metric[6] == pytest.approx(200 / 3)
+        assert metric[7:] == ("A1", 3000.0, 0.75)
+
+        daily = conn.execute(
+            """
+            SELECT broker_snapshot_count,
+                   broker_score_avg,
+                   broker_score_max,
+                   broker_ask_ratio_avg,
+                   broker_ask_volume_share_avg
+              FROM microstructure_daily_features
+             WHERE _code = 'HK.00700'
+            """
+        ).fetchone()
+        assert daily[0] == 1
+        assert daily[1] == pytest.approx(200 / 3)
+        assert daily[2] == pytest.approx(200 / 3)
+        assert daily[3] == pytest.approx(2 / 3)
+        assert daily[4] == pytest.approx(0.8)
+
+        assert conn.execute(
+            """
+            SELECT broker_queue_snapshots,
+                   broker_queue_levels,
+                   broker_queue_metric_rows,
+                   microstructure_daily_feature_rows
+              FROM tick_runs
+            """
+        ).fetchone() == (1, 3, 1, 1)
     finally:
         conn.close()
 

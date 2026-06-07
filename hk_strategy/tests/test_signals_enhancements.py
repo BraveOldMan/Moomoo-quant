@@ -17,7 +17,15 @@ class _Data:
 
     def get_market_snapshot(self, _code: str):
         return ft.RET_OK, pd.DataFrame(
-            [{"last_price": 10.0, "turnover": 8_000_000.0, "turnover_rate": 1.0}]
+            [
+                {
+                    "last_price": 10.0,
+                    "turnover": 8_000_000.0,
+                    "turnover_rate": 1.0,
+                    "dark_status": "TRADING",
+                    "sec_status": "NORMAL",
+                }
+            ]
         )
 
     def get_capital_distribution(self, _code: str):
@@ -96,6 +104,7 @@ def test_hk_signals_record_lunch_broker_pressure_and_futures_block() -> None:
         use_order_book_pressure=True,
         use_order_book_metrics=True,
         use_l2_imbalance_tracker=True,
+        use_hk_status_signal=True,
         use_dark_pool_proxy=True,
         use_lunch_continuation=True,
         use_hk_futures_filter=True,
@@ -113,10 +122,16 @@ def test_hk_signals_record_lunch_broker_pressure_and_futures_block() -> None:
     assert second.scores["book_pressure"] < 50.0
     assert {"book_spread", "book_slippage"}.issubset(second.scores)
     assert "l2_imbalance" in second.scores
+    assert second.scores["hk_status"] == 60.0
+    assert second.extra["hk_status"] == {
+        "dark_status": "TRADING",
+        "sec_status": "NORMAL",
+    }
     assert second.scores["dark_pool_proxy"] == 0.0
     assert cfg.active_weights()["book_spread"] == 0.0
     assert cfg.active_weights()["book_slippage"] == 0.0
     assert cfg.active_weights()["l2_imbalance"] == 0.0
+    assert cfg.active_weights()["hk_status"] == 0.0
     assert cfg.active_weights()["dark_pool_proxy"] == 0.0
     assert second.scores["lunch_continuation"] < 50.0
     assert "恒指/国指期货过滤数据缺失" in second.buy_block_reasons

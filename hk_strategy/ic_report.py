@@ -56,6 +56,7 @@ EXTENSION_FACTORS = (
     "book_spread",
     "book_slippage",
     "l2_imbalance",
+    "hk_status",
     "lunch_continuation",
     "intraday_flow",
     "short",

@@ -184,6 +184,7 @@ class StrategyConfig:
     w_book_spread: float = 0.0
     w_book_slippage: float = 0.0
     w_l2_imbalance: float = 0.0
+    w_hk_status: float = 0.0
     w_intraday_flow: float = 0.0
     w_short: float = 0.0  # 做空面
     w_option_iv: float = 0.0  # 期权隐含
@@ -210,6 +211,7 @@ class StrategyConfig:
     # ── 经纪队列信号（港股有经纪商队列，可启用；须校准后赋权）──────────
     use_broker_signal: bool = False
     use_broker_gate: bool = False
+    use_hk_status_signal: bool = False
 
     # ── 组合熔断 ────────────────────────────────────────────────────────
     daily_loss_limit_pct: float = 0.02  # 当日账户亏损超过 2% 暂停买入
@@ -301,6 +303,7 @@ class StrategyConfig:
             ),
             use_broker_signal=_bool("USE_BROKER_SIGNAL", False),
             use_broker_gate=_bool("USE_BROKER_GATE", False),
+            use_hk_status_signal=_bool("USE_HK_STATUS_SIGNAL", False),
             use_orb=_bool("USE_ORB", False),
             use_rs=_bool("USE_RS", False),
             use_vwap_signal=_bool("USE_VWAP_SIGNAL", False),
@@ -355,6 +358,7 @@ class StrategyConfig:
             w_book_spread=float(os.environ.get("W_BOOK_SPREAD", "0.0")),
             w_book_slippage=float(os.environ.get("W_BOOK_SLIPPAGE", "0.0")),
             w_l2_imbalance=float(os.environ.get("W_L2_IMBALANCE", "0.0")),
+            w_hk_status=float(os.environ.get("W_HK_STATUS", "0.0")),
             use_microstructure_gate=_bool("USE_MICROSTRUCTURE_GATE", False),
             microstructure_block_score=float(
                 os.environ.get("MICROSTRUCTURE_BLOCK_SCORE", "70.0")
@@ -417,6 +421,8 @@ class StrategyConfig:
             weights["book_slippage"] = self.w_book_slippage
         if self.use_l2_imbalance_tracker:
             weights["l2_imbalance"] = self.w_l2_imbalance
+        if self.use_hk_status_signal:
+            weights["hk_status"] = self.w_hk_status
         if self.use_intraday_flow:
             weights["intraday_flow"] = self.w_intraday_flow
         if self.use_short_metrics:
