@@ -219,6 +219,7 @@ class BacktestEngine:
             return BacktestResult(self._initial_cash, self._initial_cash)
         all_data = pd.concat(frames, ignore_index=True)
         bench = self._fetch_benchmark(start, end)
+        filter_data = self._fetch_filter_data(start, end)
 
         trade_dates = sorted(all_data["time_key"].unique())
         weights = cfg.active_weights()
@@ -262,6 +263,7 @@ class BacktestEngine:
                     atr = features.compute_atr(
                         h["high"], h["low"], h["close"], cfg.atr_period
                     )
+                    buy_blocks = self._buy_block_reasons(dt_key, filter_data)
                     cash, _ = self._apply_decision(
                         dt_key,
                         code,
@@ -269,6 +271,7 @@ class BacktestEngine:
                         score,
                         atr,
                         h["turnover"][-1],
+                        buy_blocks,
                         cash,
                         positions,
                         trades,
@@ -336,7 +339,17 @@ class BacktestEngine:
         return features.score_from_features(scores, weights)
 
     def _apply_decision(
-        self, dt, code, close, score, atr, turnover_usd, cash, positions, trades
+        self,
+        dt: str,
+        code: str,
+        close: float,
+        score: float,
+        atr: float | None,
+        turnover_usd: float,
+        buy_block_reasons: list[str],
+        cash: float,
+        positions: dict[str, dict],
+        trades: list[TradeRecord],
     ) -> tuple[float, bool]:
         cfg = self._cfg
         in_pos = code in positions
@@ -370,6 +383,7 @@ class BacktestEngine:
             and tranches < cfg.entry_tranches
             and liquidity_ok
             and can_open
+            and not buy_block_reasons
         ):
             if cfg.use_atr_sizing and atr and atr > 0:
                 net = cash  # 回测以现金近似可用净值
@@ -400,6 +414,79 @@ class BacktestEngine:
                     }
                 trades.append(TradeRecord(dt, code, "BUY", close, qty, comm))
         return cash, False
+
+    def _fetch_filter_data(self, start: str, end: str) -> dict[str, pd.DataFrame]:
+        """拉取可回测过滤器代理标的日线；仅用于历史买入门禁。"""
+        symbols: set[str] = set()
+        if self._cfg.use_hk_futures_filter:
+            symbols.update(self._cfg.hk_futures_symbols)
+            symbols.update(self._cfg.hk_futures_proxy_symbols)
+        data: dict[str, pd.DataFrame] = {}
+        for symbol in sorted(symbols):
+            df = self._fetch_one(symbol, start, end)
+            if not df.empty:
+                data[symbol] = df.sort_values("time_key").reset_index(drop=True)
+        return data
+
+    def _buy_block_reasons(
+        self, dt: str, filter_data: dict[str, pd.DataFrame]
+    ) -> list[str]:
+        """按回测日 dt 之前的数据生成买入门禁原因。"""
+        reasons: list[str] = []
+        cfg = self._cfg
+        if cfg.use_hk_futures_filter:
+            score = self._hk_futures_filter_score_at(dt, filter_data)
+            if score is None:
+                reasons.append("恒指/国指期货过滤数据缺失")
+            elif score >= cfg.hk_futures_filter_block_score:
+                reasons.append(f"恒指/国指期货风险偏高: score={score:.1f}")
+        return reasons
+
+    def _hk_futures_filter_score_at(
+        self, dt: str, filter_data: dict[str, pd.DataFrame]
+    ) -> float | None:
+        """计算回测日之前的恒指/国指期货或代理过滤分。"""
+        primary = self._trend_scores_at(
+            self._cfg.hk_futures_symbols,
+            dt,
+            filter_data,
+            self._cfg.hk_futures_filter_lookback_days,
+        )
+        scores = primary or self._trend_scores_at(
+            self._cfg.hk_futures_proxy_symbols,
+            dt,
+            filter_data,
+            self._cfg.hk_futures_filter_lookback_days,
+        )
+        if not scores:
+            return None
+        return sum(scores) / len(scores)
+
+    def _trend_scores_at(
+        self,
+        symbols: tuple[str, ...],
+        dt: str,
+        filter_data: dict[str, pd.DataFrame],
+        lookback_days: int,
+    ) -> list[float]:
+        """用 dt 之前的日线计算一组风险资产代理趋势分。"""
+        out: list[float] = []
+        for symbol in symbols:
+            df = filter_data.get(symbol)
+            if df is None or df.empty:
+                continue
+            hist = df[df["time_key"].astype(str) < dt]
+            if len(hist) <= lookback_days:
+                continue
+            closes = [float(x) for x in hist["close"]]
+            first = closes[-1 - lookback_days]
+            last = closes[-1]
+            if first <= 0:
+                continue
+            change = (last - first) / first
+            if math.isfinite(change):
+                out.append(features.asset_trend_score(change, risk_on=True))
+        return out
 
     def _can_exit(self, position: dict, dt: str) -> bool:
         if self._cfg.min_hold_days <= 0:

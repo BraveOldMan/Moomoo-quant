@@ -8,18 +8,24 @@ from us_strategy.backtest import BacktestEngine
 from us_strategy.config import StrategyConfig
 
 
-def _bars(code: str, turnovers: list[float] | None = None) -> pd.DataFrame:
-    turnover_values = turnovers or [2_000_000.0, 2_000_000.0, 2_000_000.0]
+def _bars(
+    code: str,
+    turnovers: list[float] | None = None,
+    closes: list[float] | None = None,
+) -> pd.DataFrame:
+    close_values = closes or [10.0, 10.5, 11.0]
+    turnover_values = turnovers or [2_000_000.0 for _ in close_values]
+    dates = pd.date_range("2024-01-02", periods=len(close_values), freq="D")
     return pd.DataFrame(
         {
-            "time_key": ["2024-01-02", "2024-01-03", "2024-01-04"],
-            "open": [10.0, 10.5, 11.0],
-            "close": [10.0, 10.5, 11.0],
-            "high": [10.2, 10.7, 11.2],
-            "low": [9.8, 10.3, 10.8],
+            "time_key": dates.strftime("%Y-%m-%d").tolist(),
+            "open": close_values,
+            "close": close_values,
+            "high": [x + 0.2 for x in close_values],
+            "low": [x - 0.2 for x in close_values],
             "turnover": turnover_values,
-            "turnover_rate": [0.0, 0.0, 0.0],
-            "code": [code, code, code],
+            "turnover_rate": [0.0 for _ in close_values],
+            "code": [code for _ in close_values],
         }
     )
 
@@ -71,5 +77,28 @@ def test_backtest_respects_liquidity_filter() -> None:
     )
     cfg = StrategyConfig(entry_tranches=1, min_daily_turnover_usd=1_000_000)
     result = BacktestEngine(quote, cfg).run(["US.THIN"], "2024-01-02", "2024-01-04")
+
+    assert not [trade for trade in result.trades if trade.side == "BUY"]
+
+
+def test_backtest_macro_filter_blocks_new_buys() -> None:
+    quote = _Quote(
+        {
+            "US.TEST": _bars("US.TEST", closes=[10.0, 10.2, 10.4, 10.6]),
+            "US.QQQ": _bars("US.QQQ", closes=[100.0, 95.0, 90.0, 85.0]),
+            "US.SPY": _bars("US.SPY"),
+        }
+    )
+    cfg = StrategyConfig(
+        entry_tranches=1,
+        use_macro_filter=True,
+        macro_risk_on_symbols=("US.QQQ",),
+        macro_risk_off_symbols=(),
+        macro_filter_lookback_days=1,
+        macro_filter_block_score=60.0,
+    )
+    result = BacktestEngine(quote, cfg).run(
+        ["US.TEST"], "2024-01-02", "2024-01-05"
+    )
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]

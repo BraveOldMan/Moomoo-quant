@@ -62,6 +62,13 @@ def test_rs_score_outperform_low_risk():
     assert F.rs_score(-0.1, 0.0) > 50
 
 
+def test_asset_trend_score_respects_risk_on_flag():
+    assert F.asset_trend_score(0.05, risk_on=True) < 50
+    assert F.asset_trend_score(-0.05, risk_on=True) > 50
+    assert F.asset_trend_score(0.05, risk_on=False) > 50
+    assert F.asset_trend_score(-0.05, risk_on=False) < 50
+
+
 def test_vwap_score_above_below():
     assert F.vwap_score(last=105, vwap=100) < 50
     assert F.vwap_score(last=95, vwap=100) > 50
@@ -88,6 +95,44 @@ def test_order_book_imbalance_score_bid_heavy_low_risk():
     ask_heavy = F.order_book_imbalance_score(bid_depth=200, ask_depth=800)
     assert bid_heavy < 50 < ask_heavy
     assert F.order_book_imbalance_score(0, 0) == 50.0
+
+
+def test_order_book_pressure_score_delta_direction():
+    support_added = F.order_book_pressure_score(
+        prev_bid_depth=500,
+        prev_ask_depth=500,
+        bid_depth=800,
+        ask_depth=300,
+    )
+    pressure_added = F.order_book_pressure_score(
+        prev_bid_depth=500,
+        prev_ask_depth=500,
+        bid_depth=300,
+        ask_depth=800,
+    )
+    assert support_added < 50 < pressure_added
+    assert F.order_book_pressure_score(0, 0, 0, 0) == 50.0
+
+
+def test_order_book_spread_and_slippage_scores_direction():
+    tight_spread = F.order_book_spread_score(1.0)
+    wide_spread = F.order_book_spread_score(60.0)
+    low_slippage = F.order_book_slippage_score(2.0)
+    high_slippage = F.order_book_slippage_score(80.0)
+
+    assert tight_spread < wide_spread
+    assert low_slippage < high_slippage
+    assert F.order_book_spread_score(float("nan")) == 50.0
+    assert F.order_book_slippage_score(float("nan")) == 50.0
+
+
+def test_lunch_continuation_score_direction():
+    continued_strength = F.lunch_continuation_score(0.01, 0.01)
+    upside_reversal = F.lunch_continuation_score(-0.01, 0.01)
+    failed_follow_through = F.lunch_continuation_score(0.01, -0.01)
+    continued_weakness = F.lunch_continuation_score(-0.01, -0.01)
+    assert continued_strength < upside_reversal < failed_follow_through
+    assert continued_weakness > 50
 
 
 def test_linregress_slope_directions():

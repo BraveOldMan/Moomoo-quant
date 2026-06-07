@@ -19,6 +19,7 @@ from datetime import timedelta
 
 import moomoo as ft
 
+from . import features
 from .clock import market_date
 from .config import StrategyConfig
 
@@ -177,6 +178,54 @@ def _check_microstructure(quote_ctx, code: str) -> dict:
             pass
 
 
+def _check_trend_proxy(
+    quote_ctx,
+    symbols: tuple[str, ...],
+    lookback_days: int,
+    risk_on: bool,
+) -> dict:
+    """检查一组趋势过滤代理，返回首个可用代理的风险分。"""
+    today = market_date(StrategyConfig.market_timezone)
+    end = today.isoformat()
+    start = (today - timedelta(days=lookback_days * 3 + 20)).isoformat()
+    errors: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            ret, df, _ = quote_ctx.request_history_kline(
+                symbol,
+                start=start,
+                end=end,
+                ktype=ft.KLType.K_DAY,
+                max_count=lookback_days + 2,
+            )
+        except Exception as exc:
+            errors[symbol] = f"异常: {exc}"
+            continue
+        if ret != ft.RET_OK or df.empty:
+            errors[symbol] = str(df)
+            continue
+        try:
+            closes = [float(x) for x in df["close"]]
+        except (KeyError, TypeError, ValueError):
+            errors[symbol] = "close 字段缺失或非法"
+            continue
+        if len(closes) <= lookback_days or closes[-1 - lookback_days] <= 0:
+            errors[symbol] = "历史窗口不足"
+            continue
+        change = (closes[-1] - closes[-1 - lookback_days]) / closes[
+            -1 - lookback_days
+        ]
+        score = features.asset_trend_score(change, risk_on=risk_on)
+        return {
+            "ok": True,
+            "symbol": symbol,
+            "change_pct": change,
+            "score": score,
+            "errors": errors,
+        }
+    return {"ok": False, "detail": errors}
+
+
 def probe(codes: list[str]) -> None:
     cfg = StrategyConfig.from_env()
     quote_ctx = ft.OpenQuoteContext(host=cfg.host, port=cfg.port)
@@ -258,6 +307,34 @@ def probe(codes: list[str]) -> None:
                 )
             else:
                 print(f"  {ms.get('detail')}")
+
+            macro_on = _check_trend_proxy(
+                quote_ctx, cfg.macro_risk_on_symbols, cfg.macro_filter_lookback_days, True
+            )
+            macro_off = _check_trend_proxy(
+                quote_ctx,
+                cfg.macro_risk_off_symbols,
+                cfg.macro_filter_lookback_days,
+                False,
+            )
+            print(
+                f"[macro_proxy]          {_status(macro_on['ok'] or macro_off['ok'])}"
+                "  (QQQ + VIX代理过滤)"
+            )
+            print(f"  risk_on: {macro_on}")
+            print(f"  risk_off: {macro_off}")
+
+            crypto = _check_trend_proxy(
+                quote_ctx,
+                cfg.crypto_filter_symbols,
+                cfg.crypto_filter_lookback_days,
+                True,
+            )
+            print(
+                f"[crypto_proxy]         {_status(crypto['ok'])}"
+                "  (COIN/IREN BTC/ETH过滤)"
+            )
+            print(f"  {crypto}")
     finally:
         quote_ctx.close()
 

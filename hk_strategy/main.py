@@ -38,6 +38,9 @@ from datetime import date, datetime, time as _time, timedelta
 
 import moomoo as ft
 
+from dark_pool_proxy import DarkPoolProxyConfig, DarkPoolProxyTracker
+from order_book_l2 import L2ImbalanceConfig, L2ImbalanceTracker, OrderBookCache
+
 from .alerts import AlertManager
 from .clock import market_date, market_datetime
 from .config import Signal, StrategyConfig
@@ -181,13 +184,46 @@ def run() -> None:
     else:
         logger.info("运行在模拟交易模式")
 
-    data = DataAccess(quote_ctx, trade_ctx, cfg)
+    use_order_book = (
+        cfg.use_order_book_imbalance
+        or cfg.use_order_book_pressure
+        or cfg.use_order_book_metrics
+        or cfg.use_l2_imbalance_tracker
+    )
+    order_book_cache = (
+        OrderBookCache(cfg.order_book_cache_max_age_s) if use_order_book else None
+    )
+    data = DataAccess(quote_ctx, trade_ctx, cfg, order_book_cache=order_book_cache)
     signal_log = SignalLogStore(cfg.db_path)
     calculator = SignalCalculator(data, cfg, signal_log=signal_log)
     strategy = IPOStrategy(calculator, cfg)
     trader = Trader(trade_ctx, data, cfg)
     store = PositionStore(cfg.db_path)
     alerts = AlertManager(cfg)
+    dark_pool_tracker = None
+    if cfg.use_dark_pool_proxy:
+        dark_pool_tracker = DarkPoolProxyTracker(
+            DarkPoolProxyConfig(
+                us_min_notional=cfg.dark_pool_us_min_notional,
+                hk_min_notional=cfg.dark_pool_hk_min_notional,
+                alert_cooldown_s=cfg.dark_pool_alert_cooldown_s,
+            )
+        )
+    l2_tracker = None
+    if cfg.use_l2_imbalance_tracker:
+        l2_tracker = L2ImbalanceTracker(
+            L2ImbalanceConfig(
+                level=cfg.l2_imbalance_level,
+                warn=cfg.l2_imbalance_warn,
+                danger=cfg.l2_imbalance_danger,
+                persist_snapshots=cfg.l2_imbalance_persist_snapshots,
+                alert_cooldown_s=cfg.l2_imbalance_alert_cooldown_s,
+                spread_warning_bps=cfg.order_book_spread_warning_bps,
+                spread_danger_bps=cfg.order_book_spread_danger_bps,
+                slippage_warning_bps=cfg.order_book_slippage_warning_bps,
+                slippage_danger_bps=cfg.order_book_slippage_danger_bps,
+            )
+        )
 
     # 恢复持仓
     saved = store.load_all()
@@ -281,12 +317,24 @@ def run() -> None:
     # 行情推送只投递事件，不直接下单
     # 微观结构因子（CVD/OBI）启用时追加实时订阅类型
     extra_subs = []
-    if cfg.use_order_flow:
+    if cfg.use_order_flow or cfg.use_dark_pool_proxy:
         extra_subs.append(ft.SubType.TICKER)
-    if cfg.use_order_book_imbalance:
+    if use_order_book:
         extra_subs.append(ft.SubType.ORDER_BOOK)
+    if cfg.use_broker_signal:
+        extra_subs.append(ft.SubType.BROKER)
     monitor = RealtimeMonitor(
-        quote_ctx, lambda c, p: events.put((c, p)), extra_sub_types=extra_subs
+        quote_ctx,
+        lambda c, p: events.put((c, p)),
+        extra_sub_types=extra_subs,
+        order_book_cache=order_book_cache,
+        l2_imbalance_tracker=l2_tracker,
+        l2_alert_callback=alerts.send if l2_tracker is not None else None,
+        dark_pool_proxy_tracker=dark_pool_tracker,
+        dark_pool_market_date_provider=lambda: market_date(
+            cfg.market_timezone
+        ).isoformat(),
+        dark_pool_alert_callback=alerts.send if dark_pool_tracker is not None else None,
     )
     monitor.start()
     if saved:

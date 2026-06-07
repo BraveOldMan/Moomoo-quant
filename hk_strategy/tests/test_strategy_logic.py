@@ -4,7 +4,8 @@
 import dataclasses
 from datetime import date
 
-from hk_strategy.config import StrategyConfig
+from hk_strategy.config import Signal, StrategyConfig
+from hk_strategy.signals import SignalResult
 from hk_strategy.strategy import IPOStrategy, _trading_days_between
 
 
@@ -12,6 +13,39 @@ def _strategy(**overrides) -> IPOStrategy:
     cfg = dataclasses.replace(StrategyConfig(), **overrides)
     # calculator 传 None：本测试只调用不触发 evaluate 的状态方法
     return IPOStrategy(calculator=None, config=cfg)  # type: ignore[arg-type]
+
+
+class _FakeCalculator:
+    def __init__(self, result: SignalResult) -> None:
+        self._result = result
+
+    def calculate(
+        self, _code: str, last_price: float | None = None
+    ) -> SignalResult | None:
+        return self._result
+
+
+def _signal_result(**overrides) -> SignalResult:
+    base = {
+        "code": "HK.X",
+        "scores": {"turnover": 10.0, "capital": 10.0, "momentum": 10.0},
+        "composite_score": 20.0,
+        "turnover_rate": 1.0,
+        "liquidity_ok": True,
+        "lockup_warning": False,
+        "atr": None,
+        "last_price": 10.0,
+        "extra": {},
+        "risk_warnings": [],
+        "buy_block_reasons": [],
+    }
+    base.update(overrides)
+    return SignalResult(**base)
+
+
+def _strategy_with_result(result: SignalResult, **overrides) -> IPOStrategy:
+    cfg = dataclasses.replace(StrategyConfig(), **overrides)
+    return IPOStrategy(calculator=_FakeCalculator(result), config=cfg)
 
 
 # ── 加权平均成本 ────────────────────────────────────────────────────────
@@ -95,3 +129,37 @@ def test_can_sell_respects_min_hold_days_disabled():
     s = _strategy(min_hold_days=0)
     s.record_buy("US.X", 10.0, 100)
     assert s._can_sell("US.X") is True
+
+
+def test_buy_gate_blocks_only_new_buy_signal():
+    result = _signal_result(buy_block_reasons=["恒指/国指期货风险偏高"])
+    s = _strategy_with_result(result, min_hold_days=0)
+
+    decision = s.evaluate("HK.X", current_price=10.0)
+
+    assert decision.signal is Signal.HOLD
+    assert "买入门禁" in decision.reason
+
+
+def test_buy_gate_does_not_block_sell_signal():
+    result = _signal_result(
+        scores={"turnover": 90.0, "capital": 90.0, "momentum": 90.0},
+        composite_score=80.0,
+        buy_block_reasons=["恒指/国指期货风险偏高"],
+    )
+    s = _strategy_with_result(result, min_hold_days=0)
+    s.record_buy("HK.X", 10.0, 100)
+
+    decision = s.evaluate("HK.X", current_price=10.0)
+
+    assert decision.signal is Signal.SELL
+
+
+def test_option_warning_does_not_block_buy_signal():
+    result = _signal_result(risk_warnings=["期权skew/PCR风险偏高: score=80.0"])
+    s = _strategy_with_result(result, min_hold_days=0)
+
+    decision = s.evaluate("HK.X", current_price=10.0)
+
+    assert decision.signal is Signal.BUY
+    assert "风险提示" in decision.reason

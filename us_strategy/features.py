@@ -88,6 +88,16 @@ def rs_score(stock_return: float, bench_return: float) -> float:
     return _clamp(50.0 - diff * 250.0)
 
 
+def asset_trend_score(change_pct: float, risk_on: bool = True) -> float:
+    """资产趋势过滤风险分。
+
+    risk_on=True 时，资产上涨代表风险偏好改善（如 QQQ/BTC/ETH）；
+    risk_on=False 时，资产上涨代表避险升温（如 VIX 代理）。
+    change_pct 使用小数口径，如 0.02 表示上涨 2%。
+    """
+    return momentum_score(change_pct) if risk_on else _clamp(50.0 + change_pct * 250.0)
+
+
 def vwap_score(last: float, vwap: float) -> float:
     """VWAP 偏离：价在 VWAP 之上→多头掌控（低风险），之下→弱势（高风险）。"""
     if vwap <= 0:
@@ -124,6 +134,77 @@ def order_book_imbalance_score(bid_depth: float, ask_depth: float) -> float:
         return 50.0
     obi = (bid_depth - ask_depth) / total
     return _clamp(50.0 - obi * 50.0)
+
+
+def order_book_pressure_score(
+    prev_bid_depth: float,
+    prev_ask_depth: float,
+    bid_depth: float,
+    ask_depth: float,
+) -> float:
+    """盘口撤单/挂单压力风险分。
+
+    仅比较进程内上一轮与当前轮的同档位累计深度，不做历史回补。
+    买盘增加或卖盘减少 → 支撑增强 → 低风险；买盘撤单或卖盘增加 → 高风险。
+    """
+    total = prev_bid_depth + prev_ask_depth + bid_depth + ask_depth
+    if total <= 0:
+        return 50.0
+    bid_delta = bid_depth - prev_bid_depth
+    ask_delta = ask_depth - prev_ask_depth
+    pressure = (ask_delta - bid_delta) / (total / 2.0)
+    return _clamp(50.0 + pressure * 100.0)
+
+
+def order_book_spread_score(
+    spread_bps: float,
+    warning_bps: float = 5.0,
+    danger_bps: float = 30.0,
+) -> float:
+    """Score visible bid/ask spread risk in basis points."""
+
+    if spread_bps < 0 or not math.isfinite(spread_bps):
+        return 50.0
+    if spread_bps < warning_bps:
+        return spread_bps / warning_bps * 30.0 if warning_bps > 0 else 0.0
+    if spread_bps < danger_bps:
+        span = danger_bps - warning_bps
+        return 30.0 + (spread_bps - warning_bps) / span * 40.0 if span > 0 else 70.0
+    return _clamp(70.0 + (spread_bps - danger_bps) * 2.0)
+
+
+def order_book_slippage_score(
+    slippage_bps: float,
+    warning_bps: float = 10.0,
+    danger_bps: float = 50.0,
+) -> float:
+    """Score visible-book execution slippage risk in basis points."""
+
+    if slippage_bps < 0 or not math.isfinite(slippage_bps):
+        return 50.0
+    if slippage_bps < warning_bps:
+        return slippage_bps / warning_bps * 30.0 if warning_bps > 0 else 0.0
+    if slippage_bps < danger_bps:
+        span = danger_bps - warning_bps
+        return 30.0 + (slippage_bps - warning_bps) / span * 40.0 if span > 0 else 70.0
+    return _clamp(70.0 + (slippage_bps - danger_bps) * 1.5)
+
+
+def lunch_continuation_score(pre_return: float, post_return: float) -> float:
+    """港股午休前后延续性风险分。
+
+    pre_return 为午休前短窗收益，post_return 为下午开盘后短窗收益，均为小数。
+    午前强且午后延续为低风险；午前强但午后反转、或午前弱且午后继续弱为高风险。
+    """
+    if pre_return > 0 and post_return > 0:
+        return _clamp(35.0 - (pre_return + post_return) * 250.0)
+    if pre_return > 0 and post_return < 0:
+        return _clamp(65.0 + abs(post_return) * 500.0)
+    if pre_return < 0 and post_return < 0:
+        return _clamp(65.0 + abs(pre_return + post_return) * 250.0)
+    if pre_return < 0 and post_return > 0:
+        return _clamp(45.0 - post_return * 250.0)
+    return 50.0
 
 
 def linregress_slope(values: list[float]) -> float | None:

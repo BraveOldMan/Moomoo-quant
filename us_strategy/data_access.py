@@ -4,7 +4,7 @@
 职责：
   1. TTL 缓存：snapshot / 资金分布 / K 线 / 持仓 / 账户，避免对同一标的
      在推送 + 轮询双重触发下重复请求。
-  2. 令牌桶限流：moomoo OpenD 约 30 次/30 秒，统一在此节流，防止撞频。
+  2. 令牌桶限流：默认读取 moomoo_rate_limits.py 的保守全局桶，防止撞频。
   3. 线程安全：缓存与限流器均加锁，可被多线程共享。
 
 所有方法保持与原生 SDK 相同的 (ret_code, data) 返回形态，便于调用方迁移。
@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 import moomoo as ft
+
+from order_book_l2 import OrderBookCache
 
 logger = logging.getLogger(__name__)
 
@@ -56,10 +58,17 @@ class _TokenBucket:
 class DataAccess:
     """带缓存与限流的行情/交易数据门面。"""
 
-    def __init__(self, quote_ctx, trade_ctx, config):
+    def __init__(
+        self,
+        quote_ctx,
+        trade_ctx,
+        config,
+        order_book_cache: OrderBookCache | None = None,
+    ) -> None:
         self._quote = quote_ctx
         self._trade = trade_ctx
         self._cfg = config
+        self._order_book_cache = order_book_cache
         self._cache: dict[str, _CacheEntry] = {}
         self._cache_lock = threading.Lock()
         self._bucket = _TokenBucket(config.api_rate_limit, config.api_rate_window_s)
@@ -153,6 +162,10 @@ class DataAccess:
         )
 
     def get_order_book(self, code: str, num: int) -> tuple:
+        if self._order_book_cache is not None:
+            cached = self._order_book_cache.get(code, min_levels=num)
+            if cached is not None:
+                return ft.RET_OK, cached
         return self._cached(
             f"orderbook:{code}:{num}",
             self._cfg.snapshot_cache_ttl_s,

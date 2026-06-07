@@ -27,10 +27,11 @@ Env:
 
 from __future__ import annotations
 
-import math
 import os
 import sqlite3
 from dataclasses import dataclass
+
+from research.diagnostics import aggregate_ic as _shared_aggregate_ic
 
 from .analysis import forward_ic_from_log
 from .persistence import SignalLogRecord, SignalLogStore
@@ -42,7 +43,25 @@ MIN_PAIRS_PER_DAY = 10  # a day counts only if it yields >= this many fwd pairs
 DEFAULT_MIN_DAYS = 20  # qualifying days before a verdict may read "达标"
 
 CORE_FACTORS = ("capital", "turnover", "momentum")
-EXTENSION_FACTORS = ("order_flow", "obi", "intraday_flow", "short", "option_iv")
+EXTENSION_FACTORS = (
+    "broker",
+    "order_flow",
+    "dark_pool_proxy",
+    "obi",
+    "obi_l1",
+    "obi_l3",
+    "obi_l5",
+    "obi_l10",
+    "book_pressure",
+    "book_spread",
+    "book_slippage",
+    "l2_imbalance",
+    "lunch_continuation",
+    "intraday_flow",
+    "short",
+    "option_iv",
+    "hk_futures_filter",
+)
 ALL_FACTORS = CORE_FACTORS + EXTENSION_FACTORS
 
 
@@ -64,17 +83,7 @@ def aggregate_ic(daily_ics: list[float]) -> tuple[int, float, float, float]:
     std is the sample stddev (ddof=1); IR = mean/std. With <2 days std and IR
     are NaN (cannot estimate spread yet).
     """
-    vals = [x for x in daily_ics if x == x]  # drop NaN
-    n = len(vals)
-    if n == 0:
-        return 0, float("nan"), float("nan"), float("nan")
-    mean = sum(vals) / n
-    if n < 2:
-        return n, mean, float("nan"), float("nan")
-    var = sum((x - mean) ** 2 for x in vals) / (n - 1)
-    std = math.sqrt(var)
-    ir = mean / std if std > 0 else float("nan")
-    return n, mean, std, ir
+    return _shared_aggregate_ic(daily_ics)
 
 
 def verdict(agg: FactorAgg, min_days: int = DEFAULT_MIN_DAYS) -> str:

@@ -19,6 +19,7 @@ from datetime import timedelta
 
 import moomoo as ft
 
+from . import features
 from .clock import market_date
 from .config import StrategyConfig
 
@@ -177,6 +178,53 @@ def _check_microstructure(quote_ctx, code: str) -> dict:
             pass
 
 
+def _check_trend_proxies(
+    quote_ctx,
+    symbols: tuple[str, ...],
+    lookback_days: int,
+) -> dict:
+    """检查恒指/国指过滤代理，返回所有可用代理的趋势风险分。"""
+    today = market_date(StrategyConfig.market_timezone)
+    end = today.isoformat()
+    start = (today - timedelta(days=lookback_days * 3 + 20)).isoformat()
+    items: list[dict] = []
+    errors: dict[str, str] = {}
+    for symbol in symbols:
+        try:
+            ret, df, _ = quote_ctx.request_history_kline(
+                symbol,
+                start=start,
+                end=end,
+                ktype=ft.KLType.K_DAY,
+                max_count=lookback_days + 2,
+            )
+        except Exception as exc:
+            errors[symbol] = f"异常: {exc}"
+            continue
+        if ret != ft.RET_OK or df.empty:
+            errors[symbol] = str(df)
+            continue
+        try:
+            closes = [float(x) for x in df["close"]]
+        except (KeyError, TypeError, ValueError):
+            errors[symbol] = "close 字段缺失或非法"
+            continue
+        if len(closes) <= lookback_days or closes[-1 - lookback_days] <= 0:
+            errors[symbol] = "历史窗口不足"
+            continue
+        change = (closes[-1] - closes[-1 - lookback_days]) / closes[
+            -1 - lookback_days
+        ]
+        items.append(
+            {
+                "symbol": symbol,
+                "change_pct": change,
+                "score": features.asset_trend_score(change, risk_on=True),
+            }
+        )
+    return {"ok": bool(items), "items": items, "errors": errors}
+
+
 def probe(codes: list[str]) -> None:
     cfg = StrategyConfig.from_env()
     quote_ctx = ft.OpenQuoteContext(host=cfg.host, port=cfg.port)
@@ -215,6 +263,8 @@ def probe(codes: list[str]) -> None:
             print(
                 f"[broker_queue]         {_status(bq['ok'])}  (港股可用，但须先订阅 Broker 数据)"
             )
+            if bq["ok"]:
+                print(f"  bid_rows={bq['bid_rows']} ask_rows={bq['ask_rows']}")
             if not bq["ok"]:
                 print(f"  {bq['detail']}")
 
@@ -258,6 +308,23 @@ def probe(codes: list[str]) -> None:
                 )
             else:
                 print(f"  {ms.get('detail')}")
+
+            futures = _check_trend_proxies(
+                quote_ctx,
+                cfg.hk_futures_symbols,
+                cfg.hk_futures_filter_lookback_days,
+            )
+            proxies = _check_trend_proxies(
+                quote_ctx,
+                cfg.hk_futures_proxy_symbols,
+                cfg.hk_futures_filter_lookback_days,
+            )
+            print(
+                f"[hk_futures_filter]    {_status(futures['ok'] or proxies['ok'])}"
+                "  (恒指/国指期货，失败回退指数/ETF代理)"
+            )
+            print(f"  futures: {futures}")
+            print(f"  proxies: {proxies}")
     finally:
         quote_ctx.close()
 

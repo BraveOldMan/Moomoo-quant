@@ -45,10 +45,16 @@ def _enable_all_factors(cfg: StrategyConfig) -> StrategyConfig:
         use_orb=True,
         use_vwap_signal=True,
         use_order_flow=True,
+        use_dark_pool_proxy=True,
         use_order_book_imbalance=True,
+        use_order_book_pressure=True,
+        use_order_book_metrics=True,
+        use_l2_imbalance_tracker=True,
         use_intraday_flow=True,
         use_short_metrics=True,
         use_option_iv=True,
+        use_macro_filter=True,
+        use_crypto_filter=True,
     )
 
 

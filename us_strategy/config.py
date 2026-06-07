@@ -3,7 +3,17 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 
+from moomoo_rate_limits import DEFAULT_DATA_ACCESS_RATE_LIMIT, DEFAULT_RATE_WINDOW_S
+
 _DEFAULT_WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.txt")
+
+
+def _csv_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """从环境变量读取逗号分隔配置，空值回退默认 tuple。"""
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
 
 
 def _load_watchlist() -> tuple:
@@ -109,8 +119,31 @@ class StrategyConfig:
     # 须靠 forward-logging 前向校准后再赋权启用。默认全关、权重 0。
     use_order_flow: bool = False  # CVD 主动买卖盘失衡（get_rt_ticker）
     rt_ticker_num: int = 500  # 逐笔回看根数
+    use_dark_pool_proxy: bool = False
+    dark_pool_rt_ticker_num: int = 500
+    dark_pool_us_min_notional: float = 100_000.0
+    dark_pool_hk_min_notional: float = 800_000.0
+    dark_pool_alert_cooldown_s: float = 300.0
     use_order_book_imbalance: bool = False  # 盘口失衡 OBI（get_order_book）
     obi_levels: int = 5  # 盘口累计档位数
+    obi_level_buckets: tuple[str, ...] = ("1", "3", "5", "10")  # 多档 OBI 记录档位
+    use_order_book_pressure: bool = False
+    use_order_book_metrics: bool = False
+    order_book_levels: int = 50
+    order_book_slippage_qty: float = 1000.0
+    order_book_cache_max_age_s: float = 3.0
+    order_book_spread_warning_bps: float = 5.0
+    order_book_spread_danger_bps: float = 30.0
+    order_book_slippage_warning_bps: float = 10.0
+    order_book_slippage_danger_bps: float = 50.0
+    use_l2_imbalance_tracker: bool = False
+    l2_imbalance_level: int = 10
+    l2_imbalance_warn: float = 0.35
+    l2_imbalance_danger: float = 0.60
+    l2_imbalance_persist_snapshots: int = 3
+    l2_imbalance_alert_cooldown_s: float = 300.0
+    use_microstructure_gate: bool = False  # CVD/OBI 实时门禁，前向 IC 达标后再开
+    microstructure_block_score: float = 70.0
     use_intraday_flow: bool = False  # 日内机构资金流斜率（get_capital_flow INTRADAY）
     flow_slope_window: int = 30  # 斜率回看的分钟根数
 
@@ -121,6 +154,20 @@ class StrategyConfig:
     # ── 期权隐含信息（IV skew / Put-Call Ratio；仅有期权的 IPO 可用）────
     use_option_iv: bool = False
     option_iv_max_expiry_days: int = 45  # 只取最近 N 天内到期的合约算 IV
+    option_warning_score: float = 70.0  # 只产生风险提示，不进入买卖条件
+
+    # ── 可回测买入门禁（默认关闭，Sharpe 验证后再打开）──────────────
+    use_crypto_filter: bool = False
+    crypto_filter_codes: tuple[str, ...] = ("US.COIN", "US.IREN")
+    crypto_filter_symbols: tuple[str, ...] = ("CC.BTC", "CC.ETH", "US.IBIT")
+    crypto_filter_lookback_days: int = 5
+    crypto_filter_block_score: float = 70.0
+
+    use_macro_filter: bool = False
+    macro_risk_on_symbols: tuple[str, ...] = ("US.QQQ",)
+    macro_risk_off_symbols: tuple[str, ...] = ("US.VIXY", "US.UVXY")
+    macro_filter_lookback_days: int = 5
+    macro_filter_block_score: float = 70.0
 
     # ── 因子权重（启用且数据可用的因子在评分时自动归一化）──────────────
     # 新因子默认权重 0：建议先用 analysis.py 做 IC 校准再启用。
@@ -132,7 +179,12 @@ class StrategyConfig:
     w_rs: float = 0.15
     w_vwap: float = 0.10
     w_order_flow: float = 0.0  # 微观结构：须前向校准后再赋权
+    w_dark_pool_proxy: float = 0.0
     w_obi: float = 0.0
+    w_book_pressure: float = 0.0
+    w_book_spread: float = 0.0
+    w_book_slippage: float = 0.0
+    w_l2_imbalance: float = 0.0
     w_intraday_flow: float = 0.0
     w_short: float = 0.0  # 做空面
     w_option_iv: float = 0.0  # 期权隐含
@@ -179,8 +231,8 @@ class StrategyConfig:
     option_cache_ttl_s: float = 300.0  # 期权链/到期日变动慢
 
     # ── API 限流（moomoo 约 30 次/30 秒，留余量）───────────────────────
-    api_rate_limit: int = 28
-    api_rate_window_s: float = 30.0
+    api_rate_limit: int = DEFAULT_DATA_ACCESS_RATE_LIMIT
+    api_rate_window_s: float = DEFAULT_RATE_WINDOW_S
 
     # ── 回测成本模型 ────────────────────────────────────────────────────
     commission_per_share: float = 0.005  # 每股佣金（美股常见）
@@ -238,16 +290,100 @@ class StrategyConfig:
             limit_price_tolerance_pct=float(
                 os.environ.get("LIMIT_PRICE_TOLERANCE_PCT", "0.005")
             ),
+            api_rate_limit=int(
+                os.environ.get("API_RATE_LIMIT", str(DEFAULT_DATA_ACCESS_RATE_LIMIT))
+            ),
+            api_rate_window_s=float(
+                os.environ.get("API_RATE_WINDOW_S", str(DEFAULT_RATE_WINDOW_S))
+            ),
             use_broker_signal=_bool("USE_BROKER_SIGNAL", False),
             use_orb=_bool("USE_ORB", False),
             use_rs=_bool("USE_RS", False),
             use_vwap_signal=_bool("USE_VWAP_SIGNAL", False),
             use_order_flow=_bool("USE_ORDER_FLOW", False),
+            use_dark_pool_proxy=_bool("USE_DARK_POOL_PROXY", False),
+            dark_pool_rt_ticker_num=int(
+                os.environ.get("DARK_POOL_RT_TICKER_NUM", "500")
+            ),
+            dark_pool_us_min_notional=float(
+                os.environ.get("DARK_POOL_US_MIN_NOTIONAL", "100000.0")
+            ),
+            dark_pool_hk_min_notional=float(
+                os.environ.get("DARK_POOL_HK_MIN_NOTIONAL", "800000.0")
+            ),
+            dark_pool_alert_cooldown_s=float(
+                os.environ.get("DARK_POOL_ALERT_COOLDOWN_S", "300.0")
+            ),
             use_order_book_imbalance=_bool("USE_ORDER_BOOK_IMBALANCE", False),
+            use_order_book_pressure=_bool("USE_ORDER_BOOK_PRESSURE", False),
+            use_order_book_metrics=_bool("USE_ORDER_BOOK_METRICS", False),
+            order_book_levels=int(os.environ.get("ORDER_BOOK_LEVELS", "50")),
+            order_book_slippage_qty=float(
+                os.environ.get("ORDER_BOOK_SLIPPAGE_QTY", "1000.0")
+            ),
+            order_book_cache_max_age_s=float(
+                os.environ.get("ORDER_BOOK_CACHE_MAX_AGE_S", "3.0")
+            ),
+            order_book_spread_warning_bps=float(
+                os.environ.get("ORDER_BOOK_SPREAD_WARNING_BPS", "5.0")
+            ),
+            order_book_spread_danger_bps=float(
+                os.environ.get("ORDER_BOOK_SPREAD_DANGER_BPS", "30.0")
+            ),
+            order_book_slippage_warning_bps=float(
+                os.environ.get("ORDER_BOOK_SLIPPAGE_WARNING_BPS", "10.0")
+            ),
+            order_book_slippage_danger_bps=float(
+                os.environ.get("ORDER_BOOK_SLIPPAGE_DANGER_BPS", "50.0")
+            ),
+            use_l2_imbalance_tracker=_bool("USE_L2_IMBALANCE_TRACKER", False),
+            l2_imbalance_level=int(os.environ.get("L2_IMBALANCE_LEVEL", "10")),
+            l2_imbalance_warn=float(os.environ.get("L2_IMBALANCE_WARN", "0.35")),
+            l2_imbalance_danger=float(os.environ.get("L2_IMBALANCE_DANGER", "0.60")),
+            l2_imbalance_persist_snapshots=int(
+                os.environ.get("L2_IMBALANCE_PERSIST_SNAPSHOTS", "3")
+            ),
+            l2_imbalance_alert_cooldown_s=float(
+                os.environ.get("L2_IMBALANCE_ALERT_COOLDOWN_S", "300.0")
+            ),
+            w_book_pressure=float(os.environ.get("W_BOOK_PRESSURE", "0.0")),
+            w_dark_pool_proxy=float(os.environ.get("W_DARK_POOL_PROXY", "0.0")),
+            w_book_spread=float(os.environ.get("W_BOOK_SPREAD", "0.0")),
+            w_book_slippage=float(os.environ.get("W_BOOK_SLIPPAGE", "0.0")),
+            w_l2_imbalance=float(os.environ.get("W_L2_IMBALANCE", "0.0")),
+            use_microstructure_gate=_bool("USE_MICROSTRUCTURE_GATE", False),
+            microstructure_block_score=float(
+                os.environ.get("MICROSTRUCTURE_BLOCK_SCORE", "70.0")
+            ),
             use_intraday_flow=_bool("USE_INTRADAY_FLOW", False),
             use_short_metrics=_bool("USE_SHORT_METRICS", False),
             short_squeeze_reverse=_bool("SHORT_SQUEEZE_REVERSE", False),
             use_option_iv=_bool("USE_OPTION_IV", False),
+            option_warning_score=float(os.environ.get("OPTION_WARNING_SCORE", "70.0")),
+            use_crypto_filter=_bool("USE_CRYPTO_FILTER", False),
+            crypto_filter_codes=_csv_tuple(
+                "CRYPTO_FILTER_CODES", ("US.COIN", "US.IREN")
+            ),
+            crypto_filter_symbols=_csv_tuple(
+                "CRYPTO_FILTER_SYMBOLS", ("CC.BTC", "CC.ETH", "US.IBIT")
+            ),
+            crypto_filter_lookback_days=int(
+                os.environ.get("CRYPTO_FILTER_LOOKBACK_DAYS", "5")
+            ),
+            crypto_filter_block_score=float(
+                os.environ.get("CRYPTO_FILTER_BLOCK_SCORE", "70.0")
+            ),
+            use_macro_filter=_bool("USE_MACRO_FILTER", False),
+            macro_risk_on_symbols=_csv_tuple("MACRO_RISK_ON_SYMBOLS", ("US.QQQ",)),
+            macro_risk_off_symbols=_csv_tuple(
+                "MACRO_RISK_OFF_SYMBOLS", ("US.VIXY", "US.UVXY")
+            ),
+            macro_filter_lookback_days=int(
+                os.environ.get("MACRO_FILTER_LOOKBACK_DAYS", "5")
+            ),
+            macro_filter_block_score=float(
+                os.environ.get("MACRO_FILTER_BLOCK_SCORE", "70.0")
+            ),
             db_path=os.environ.get("DB_PATH", "us_strategy/positions.db"),
             alert_email=os.environ.get("ALERT_EMAIL", ""),
             alert_smtp_host=os.environ.get("SMTP_HOST", "smtp.gmail.com"),
@@ -275,12 +411,19 @@ class StrategyConfig:
             weights["vwap"] = self.w_vwap
         if self.use_order_flow:
             weights["order_flow"] = self.w_order_flow
+        if self.use_dark_pool_proxy:
+            weights["dark_pool_proxy"] = self.w_dark_pool_proxy
         if self.use_order_book_imbalance:
             weights["obi"] = self.w_obi
+        if self.use_order_book_pressure:
+            weights["book_pressure"] = self.w_book_pressure
+        if self.use_order_book_metrics:
+            weights["book_spread"] = self.w_book_spread
+            weights["book_slippage"] = self.w_book_slippage
+        if self.use_l2_imbalance_tracker:
+            weights["l2_imbalance"] = self.w_l2_imbalance
         if self.use_intraday_flow:
             weights["intraday_flow"] = self.w_intraday_flow
         if self.use_short_metrics:
             weights["short"] = self.w_short
-        if self.use_option_iv:
-            weights["option_iv"] = self.w_option_iv
         return weights

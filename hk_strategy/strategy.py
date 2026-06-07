@@ -101,12 +101,21 @@ class IPOStrategy:
 
             # 买入信号
             tranches = self._tranches_bought.get(code, 0)
-            if (
+            buy_setup = (
                 score < cfg.buy_threshold
                 and tranches < cfg.entry_tranches
                 and result.liquidity_ok
                 and not self._circuit_breaker_active
-            ):
+            )
+            if buy_setup and result.buy_block_reasons:
+                return Decision(
+                    code,
+                    Signal.HOLD,
+                    score,
+                    "买入门禁: " + "；".join(result.buy_block_reasons),
+                    result.atr,
+                )
+            if buy_setup:
                 return Decision(
                     code,
                     Signal.BUY,
@@ -286,6 +295,8 @@ class IPOStrategy:
             parts.append("开盘区间上破")
         if r.scores.get("rs", 50) < 40:
             parts.append("跑赢基准")
+        if r.risk_warnings:
+            parts.append("风险提示: " + "；".join(r.risk_warnings))
         return "，".join(parts)
 
     def _sell_reason(self, r: SignalResult) -> str:

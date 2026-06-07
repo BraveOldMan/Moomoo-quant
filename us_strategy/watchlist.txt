@@ -3,7 +3,11 @@
 # 维护：实盘证券账户持仓快照(2026-06-05) + 手动关注标的。港股不纳入（本仓库为美股策略）。
 
 # ── 手动关注 ──
-# （当前无；MRVL 已转入实盘持仓）
+US.AAPL    # Apple
+US.MSFT    # Microsoft
+US.AMZN    # Amazon
+US.GOOGL   # Alphabet Class A
+US.META    # Meta Platforms
 
 # ── 实盘持仓（美股，2026-06-05 快照）──
 US.AMD     # 美国超微

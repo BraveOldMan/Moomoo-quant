@@ -8,18 +8,24 @@ from hk_strategy.backtest import BacktestEngine
 from hk_strategy.config import StrategyConfig
 
 
-def _bars(code: str, turnovers: list[float] | None = None) -> pd.DataFrame:
-    turnover_values = turnovers or [2_000_000.0, 2_000_000.0, 2_000_000.0]
+def _bars(
+    code: str,
+    turnovers: list[float] | None = None,
+    closes: list[float] | None = None,
+) -> pd.DataFrame:
+    close_values = closes or [10.0, 10.5, 11.0]
+    turnover_values = turnovers or [2_000_000.0 for _ in close_values]
+    dates = pd.date_range("2024-01-02", periods=len(close_values), freq="D")
     return pd.DataFrame(
         {
-            "time_key": ["2024-01-02", "2024-01-03", "2024-01-04"],
-            "open": [10.0, 10.5, 11.0],
-            "close": [10.0, 10.5, 11.0],
-            "high": [10.2, 10.7, 11.2],
-            "low": [9.8, 10.3, 10.8],
+            "time_key": dates.strftime("%Y-%m-%d").tolist(),
+            "open": close_values,
+            "close": close_values,
+            "high": [x + 0.2 for x in close_values],
+            "low": [x - 0.2 for x in close_values],
             "turnover": turnover_values,
-            "turnover_rate": [0.0, 0.0, 0.0],
-            "code": [code, code, code],
+            "turnover_rate": [0.0 for _ in close_values],
+            "code": [code for _ in close_values],
         }
     )
 
@@ -75,5 +81,29 @@ def test_backtest_respects_liquidity_filter() -> None:
     )
     cfg = StrategyConfig(entry_tranches=1, min_daily_turnover=1_000_000)
     result = BacktestEngine(quote, cfg).run(["HK.THIN"], "2024-01-02", "2024-01-04")
+
+    assert not [trade for trade in result.trades if trade.side == "BUY"]
+
+
+def test_backtest_hk_futures_filter_blocks_new_buys() -> None:
+    quote = _Quote(
+        {
+            "HK.TEST": _bars("HK.TEST", closes=[10.0, 10.2, 10.4, 10.6]),
+            "HK.HSImain": _bars("HK.HSImain", closes=[100.0, 95.0, 90.0, 85.0]),
+            "HK.800000": _bars("HK.800000"),
+        }
+    )
+    cfg = StrategyConfig(
+        entry_tranches=1,
+        use_hk_futures_filter=True,
+        hk_futures_symbols=("HK.HSImain",),
+        hk_futures_proxy_symbols=(),
+        hk_futures_filter_lookback_days=1,
+        hk_futures_filter_block_score=60.0,
+        min_daily_turnover=1_000_000,
+    )
+    result = BacktestEngine(quote, cfg).run(
+        ["HK.TEST"], "2024-01-02", "2024-01-05"
+    )
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]

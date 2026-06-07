@@ -44,11 +44,18 @@ def _enable_all_factors(cfg: StrategyConfig) -> StrategyConfig:
         use_rs=True,
         use_orb=True,
         use_vwap_signal=True,
+        use_broker_signal=True,
         use_order_flow=True,
+        use_dark_pool_proxy=True,
         use_order_book_imbalance=True,
+        use_order_book_pressure=True,
+        use_order_book_metrics=True,
+        use_l2_imbalance_tracker=True,
         use_intraday_flow=True,
+        use_lunch_continuation=True,
         use_short_metrics=True,
         use_option_iv=True,
+        use_hk_futures_filter=True,
     )
 
 
@@ -73,7 +80,12 @@ def run() -> None:
     try:
         quote.subscribe(
             codes,
-            [ft.SubType.QUOTE, ft.SubType.TICKER, ft.SubType.ORDER_BOOK],
+            [
+                ft.SubType.QUOTE,
+                ft.SubType.TICKER,
+                ft.SubType.ORDER_BOOK,
+                ft.SubType.BROKER,
+            ],
             subscribe_push=False,
         )
     except Exception as exc:
