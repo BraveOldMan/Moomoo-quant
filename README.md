@@ -1,6 +1,6 @@
 # Moomoo-quant · 美股/港股多因子量化交易系统
 
-> 当前版本：v1.4.0（2026-06-08）
+> 当前版本：v1.5.0（2026-06-08）
 
 基于 **moomoo OpenD 网关**（原 Futu API）的美股（US）与港股（HK）程序化交易系统：从行情采集、多因子评分、决策（PDT/港股午休/熔断/加权成本）、限价执行、持仓恢复，到回测、因子 IC 校准、前向样本采集与每日自动体检，形成完整闭环：
 
@@ -22,7 +22,7 @@
 - [因子校准闭环](#因子校准闭环)
 - [配置（环境变量）](#配置环境变量)
 - [moomoo API 限频](#moomoo-api-限频)
-- [v1.4.0 变更摘要](#v140-变更摘要)
+- [v1.5.0 变更摘要](#v150-变更摘要)
 - [数据持久化](#数据持久化)
 - [测试](#测试)
 - [关键约定](#关键约定)
@@ -63,9 +63,9 @@ python -m hk_strategy.main
 WATCHLIST=US.AAPL,US.TSLA python -m us_strategy.main
 WATCHLIST=HK.00700,HK.09988 python -m hk_strategy.main
 
-# 回测
-python -m us_strategy.backtest
-python -m hk_strategy.backtest
+# 正式回测报告（BacktestEngine 的 CLI 包装入口）
+python -m research.run_backtest_report --market us --codes US.AAPL,US.MSFT --start 2024-01-01 --end 2024-03-31
+python -m research.run_backtest_report --market hk --codes HK.00700,HK.09988 --start 2024-01-01 --end 2024-03-31
 
 # 前向日志采集（只评分写库、不下单，为因子校准攒样本）
 python -m us_strategy.forward_monitor
@@ -74,6 +74,11 @@ python -m hk_strategy.forward_monitor
 # 前向 IC 累计体检
 python -m us_strategy.ic_report
 python -m hk_strategy.ic_report
+
+# 本地自动化与数据健康检查（只读）
+python -m tools.check_moomoo_tasks
+python -m tools.check_moomoo_data_health --db us_strategy/history_data.db --markets US,HK
+python -m tools.microstructure_features --db us_strategy/history_data.db --codes US.AAPL,HK.00700
 
 # 运行单测（无需 OpenD）
 pytest us_strategy/tests/ -q
@@ -210,18 +215,19 @@ ic_report.py        每日收盘后：每个交易日算一个横截面前向 IC
 
 没有在当前官方页面发布单接口频率的低频查询，统一在 `moomoo_rate_limits.py` 标记为 `official=False`，仓库默认按 30 次/30 秒保守处理，不允许把未知接口默认提到高频。
 
-## v1.4.0 变更摘要
+## v1.5.0 变更摘要
 
-本版本聚焦 US/HK 观察列表数据落库、盘中微观结构采集和港股状态信号前向校准，不自动调整实盘权重，不改变实盘启动红线。
+本版本聚焦自动化核验、数据健康检查、微观结构聚合查询、IC 自动门禁和正式回测报告入口，不自动调整实盘权重，不改变实盘启动红线。
 
 | 方向 | 变更 |
 |---|---|
-| 实时行情落库 | `tools.collect_moomoo_ticks` 新增低频 `get_market_snapshot` 采集，写入 `realtime_quote_snapshots`；`tick_runs` 同步记录 `quote_snapshots` |
-| 港股微观结构 | HK 盘中采集补充 `get_broker_queue` 多档经纪队列、broker metrics 与日级微观结构聚合；US 采集显式关闭 HK-only broker queue |
-| 港股状态因子 | 新增 `hk_status` 前向观察因子，使用 snapshot 的 `dark_status` / `sec_status`，默认关闭且权重 0，必须 IC 校准后才可赋权 |
-| 观察列表回填 | 每日 watchlist 回填保留 HK `dark_status` / `sec_status` 到 `hk_market_status_snapshots`，用于盘后状态追踪 |
-| 自动化 | US/HK tick 采集脚本默认写入 TICKER、quote snapshot、L2 order book、L2 imbalance、dark-pool proxy 和日级微观结构；HK 额外写 broker queue |
-| 验证 | `python -m pytest us_strategy\tests hk_strategy\tests tools\tests -q` 通过 271 项；`ruff check .` 通过 |
+| 任务核验 | 新增 `tools.check_moomoo_tasks`，只读核验 7 个 Windows 计划任务、触发器、脚本路径、隐藏窗口参数和最近结果 |
+| 数据健康 | 新增 `tools.check_moomoo_data_health`，输出本地 DB 覆盖率 JSON/Markdown，区分历史/盘后缺口 fail 与实时/L2 权限缺口 warn |
+| 微观结构聚合 | 新增 `tools.microstructure_features`，从 `realtime_quote_snapshots`、`order_book_metrics`、`microstructure_daily_features` 读取聚合特征，避免策略/研究直接扫原始 tick |
+| IC 门禁 | US/HK `ic_report` 增加机器可读 `gate_status`：`insufficient_sample` / `eligible` / `failed_sign` / `failed_ir` / `failed_mean_ic` |
+| 回测报告 | 新增 `research.run_backtest_report`，封装现有 `BacktestEngine`，输出 Markdown/JSON/trades/walk-forward 报告 |
+| 自动化 | `register_moomoo_microstructure_tasks.ps1` 统一使用 `-WindowStyle Hidden`，避免新增任务弹窗 |
+| 验证 | 全量 `pytest`、`ruff check .`、语法扫描与本地 DB 冒烟通过 |
 
 ## 数据持久化
 
@@ -253,6 +259,7 @@ ic_report.py        每日收盘后：每个交易日算一个横截面前向 IC
 pytest us_strategy/tests/ -q            # 美股纯逻辑单测，无需 OpenD
 pytest hk_strategy/tests/ -q            # 港股纯逻辑单测，无需 OpenD
 pytest tools/tests/ -q                  # 数据回填和实时落库工具单测
+pytest research/tests/ -q               # 研究、IC 门禁与回测报告单测
 pytest us_strategy/tests hk_strategy/tests tools/tests -q
 pytest --cov=us_strategy --cov-report=term-missing
 pytest --cov=hk_strategy --cov-report=term-missing
@@ -267,9 +274,10 @@ pytest --cov=hk_strategy --cov-report=term-missing
 ```bash
 python -m research.signal_lab --market us --codes US.AAPL,US.MSFT --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward
 python -m research.signal_lab --market hk --codes HK.00700,HK.09988 --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward
+python -m research.run_backtest_report --market us --codes US.AAPL,US.MSFT --start 2024-01-01 --end 2024-03-31
 ```
 
-默认缓存目录为 `data/research_cache`，输出目录为 `report/outputs/signal_research`。可选研究步骤包括 `ic`、`walkforward`、`optuna`、`quantstats`、`vectorbt`；`--refresh-cache` 才会强制重新从 OpenD 拉取数据。
+默认缓存目录为 `data/research_cache`。`signal_lab` 默认输出到 `report/outputs/signal_research`；`run_backtest_report` 默认输出到 `report/outputs/backtest_report`。可选研究步骤包括 `ic`、`walkforward`、`optuna`、`quantstats`、`vectorbt`；`--refresh-cache` 才会强制重新从 OpenD 拉取数据。
 
 ## 关键约定
 
@@ -293,6 +301,14 @@ Windows 任务计划程序（不在仓库，启动器在 `us_strategy/*.ps1` / `
 | `MoomooUSDailyWatchlistBackfill` | 每日 06:30 北京（按市场交易日跳过）| US/HK watchlist 盘后历史行情与快照回填 |
 | `MoomooUSTickCollect` | 每周一~五 21:00 北京（美股盘前启动）| 美股盘中 TICKER、quote snapshot、L2 order book、imbalance、dark-pool proxy 与日级微观结构落库 |
 | `MoomooHKTickCollect` | 每周一~五 09:15 北京（港股盘前启动）| 港股盘中 TICKER、quote snapshot、L2 order book、broker queue、imbalance、dark-pool proxy 与日级微观结构落库 |
+
+任务和数据健康只读核验：
+
+```bash
+python -m tools.check_moomoo_tasks
+python -m tools.check_moomoo_data_health --db us_strategy/history_data.db --markets US,HK
+python -m tools.microstructure_features --db us_strategy/history_data.db --codes US.AAPL,HK.00700
+```
 
 ## 港股版 `hk_strategy/`
 

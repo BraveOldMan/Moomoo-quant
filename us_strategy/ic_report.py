@@ -32,6 +32,7 @@ import sqlite3
 from dataclasses import dataclass
 
 from research.diagnostics import aggregate_ic as _shared_aggregate_ic
+from research.ic_gates import evaluate_ic_gate
 
 from .analysis import forward_ic_from_log
 from .persistence import SignalLogRecord, SignalLogStore
@@ -96,6 +97,19 @@ def verdict(agg: FactorAgg, min_days: int = DEFAULT_MIN_DAYS) -> str:
     if agg.mean_ic >= IC_MIN and agg.ir >= IR_MIN:
         return "⚠️ 符号反(考虑反向)"
     return "未达标"
+
+
+def gate_status(agg: FactorAgg, min_days: int = DEFAULT_MIN_DAYS) -> str:
+    """Return the machine-readable IC gate status for one factor aggregate."""
+
+    return evaluate_ic_gate(
+        n_days=agg.n_days,
+        mean_ic=agg.mean_ic,
+        ir=agg.ir,
+        min_days=min_days,
+        ic_min=IC_MIN,
+        ir_min=IR_MIN,
+    ).status
 
 
 # ── persistence of the IC history ───────────────────────────────────────────
@@ -181,12 +195,16 @@ def render_report(db_path: str, horizons_min: list[int], min_days: int) -> str:
         aggs = load_aggregates(db_path, h)
         lines.append(f"\n=== 前向IC 累计体检 @ horizon={h}min "
                      f"(达标: |IC|>{IC_MIN} 且 |IR|>{IR_MIN} 且负号; 共需≥{min_days}日) ===")
-        lines.append(f"{'factor':14}{'meanIC':>8}{'IR':>8}{'latest':>8}{'n_days':>7}  verdict")
+        lines.append(
+            f"{'factor':14}{'meanIC':>8}{'IR':>8}{'latest':>8}"
+            f"{'n_days':>7}  {'gate_status':18} verdict"
+        )
         for a in sorted(aggs, key=lambda x: (x.mean_ic if x.mean_ic == x.mean_ic else 9)):
             tag = "  " if a.factor in CORE_FACTORS else "* "  # * = 扩展因子
             lines.append(
                 f"{tag}{a.factor:12}{_fmt(a.mean_ic):>8}{_fmt(a.ir):>8}"
-                f"{_fmt(a.latest_ic):>8}{a.n_days:>7}  {verdict(a, min_days)}"
+                f"{_fmt(a.latest_ic):>8}{a.n_days:>7}  "
+                f"{gate_status(a, min_days):18} {verdict(a, min_days)}"
             )
     lines.append("\n注: * = 扩展因子(当前权重0)。核心因子(capital/turnover/momentum)仅作参照。")
     return "\n".join(lines)

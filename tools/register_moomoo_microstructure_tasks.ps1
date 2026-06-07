@@ -28,7 +28,7 @@ function Register-MoomooTask {
 
     $action = New-ScheduledTaskAction `
         -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$absoluteScript`"" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$absoluteScript`"" `
         -WorkingDirectory $root
     $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $DaysOfWeek -At $At
     $settings = New-ScheduledTaskSettingsSet `
@@ -65,7 +65,7 @@ function Register-MoomooDailyTask {
 
     $action = New-ScheduledTaskAction `
         -Execute 'powershell.exe' `
-        -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$absoluteScript`"" `
+        -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$absoluteScript`"" `
         -WorkingDirectory $root
     $trigger = New-ScheduledTaskTrigger -Daily -At $At
     $settings = New-ScheduledTaskSettingsSet `
