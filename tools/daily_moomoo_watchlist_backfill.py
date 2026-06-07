@@ -27,6 +27,7 @@ from us_strategy.market_calendar import is_trading_day as is_us_trading_day
 
 DEFAULT_HISTORY_START = "2024-01-01"
 DEFAULT_US_WATCHLIST = "us_strategy/watchlist.txt"
+DEFAULT_US_PROXY_WATCHLIST = "us_strategy/proxy_watchlist.txt"
 DEFAULT_HK_WATCHLIST = "hk_strategy/watchlist.txt"
 HK_STATUS_FIELDS = (
     "code",
@@ -82,6 +83,7 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated markets to run, default: US,HK.",
     )
     parser.add_argument("--us-watchlist", default=DEFAULT_US_WATCHLIST)
+    parser.add_argument("--us-proxy-watchlist", default=DEFAULT_US_PROXY_WATCHLIST)
     parser.add_argument("--hk-watchlist", default=DEFAULT_HK_WATCHLIST)
     parser.add_argument(
         "--watchlist",
@@ -172,6 +174,19 @@ def parse_markets(raw: str) -> tuple[str, ...]:
     return markets
 
 
+def merge_codes(*groups: tuple[str, ...]) -> tuple[str, ...]:
+    """Merge symbol groups while preserving order and removing duplicates."""
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for group in groups:
+        for code in group:
+            if code not in seen:
+                seen.add(code)
+                out.append(code)
+    return tuple(out)
+
+
 def build_market_specs(args: argparse.Namespace) -> dict[str, MarketSpec]:
     """Build US and HK market metadata."""
 
@@ -230,10 +245,15 @@ def build_jobs(args: argparse.Namespace) -> tuple[MarketJob, ...]:
     jobs: list[MarketJob] = []
     for market in selected:
         spec = specs[market]
-        codes = explicit_codes[market] if args.codes.strip() else load_watchlist(
-            spec.watchlist_path,
-            spec.prefix,
-        )
+        if args.codes.strip():
+            codes = explicit_codes[market]
+        else:
+            codes = load_watchlist(spec.watchlist_path, spec.prefix)
+            if market == "US":
+                codes = merge_codes(
+                    codes,
+                    load_watchlist(Path(args.us_proxy_watchlist), spec.prefix),
+                )
         if not codes:
             continue
         target_date = infer_target_date(

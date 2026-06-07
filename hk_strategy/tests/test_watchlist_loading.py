@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """观察列表加载单测（WATCHLIST 环境变量优先 + watchlist.txt 回退，无需 OpenD）。"""
 
-from hk_strategy.config import _load_watchlist
+from hk_strategy.config import StrategyConfig, _load_watchlist
+from hk_strategy.main import _tradable_watchlist
 
 
 def test_env_takes_precedence_over_file(tmp_path, monkeypatch):
@@ -50,3 +51,12 @@ def test_blank_env_falls_back_to_file(tmp_path, monkeypatch):
 
     # Act / Assert
     assert _load_watchlist() == ("US.TSLA",)
+
+
+def test_tradable_watchlist_excludes_benchmark_symbol() -> None:
+    cfg = StrategyConfig(
+        watchlist=("HK.00700", "HK.800000", "HK.02800"),
+        trade_excluded_symbols=("HK.800000",),
+    )
+
+    assert _tradable_watchlist(cfg) == ("HK.00700", "HK.02800")

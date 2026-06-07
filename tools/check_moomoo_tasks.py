@@ -14,7 +14,7 @@ EXPECTED_TASKS: tuple[dict[str, Any], ...] = (
         "task_name": "MoomooForwardCollect",
         "script_path": "us_strategy\\forward_collect.ps1",
         "trigger_type": "weekly",
-        "time": "21:00",
+        "time": "16:00",
     },
     {
         "task_name": "MoomooICReport",
@@ -51,6 +51,18 @@ EXPECTED_TASKS: tuple[dict[str, Any], ...] = (
         "script_path": "us_strategy\\tick_collect.ps1",
         "trigger_type": "weekly",
         "time": "21:00",
+    },
+    {
+        "task_name": "MoomooUSSimTrade",
+        "script_path": "us_strategy\\run_simulate.ps1",
+        "trigger_type": "weekly",
+        "time": "21:15",
+    },
+    {
+        "task_name": "MoomooHKSimTrade",
+        "script_path": "hk_strategy\\run_simulate_task.ps1",
+        "trigger_type": "weekly",
+        "time": "09:15",
     },
 )
 
@@ -142,13 +154,18 @@ def fetch_windows_task_records() -> list[dict[str, Any]]:
     names = ",".join(f"'{task['task_name']}'" for task in EXPECTED_TASKS)
     script = f"""
 $names = @({names})
+$tasks = Get-ScheduledTask -ErrorAction Stop | Where-Object {{ $names -contains $_.TaskName }}
+$byName = @{{}}
+foreach ($task in $tasks) {{
+    $byName[$task.TaskName] = $task
+}}
 $rows = foreach ($name in $names) {{
-    $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-    if ($null -eq $task) {{
+    if (-not $byName.ContainsKey($name)) {{
         [PSCustomObject]@{{ TaskName = $name; Exists = $false }}
         continue
     }}
-    $info = Get-ScheduledTaskInfo -TaskName $name
+    $task = $byName[$name]
+    $info = Get-ScheduledTaskInfo -TaskName $name -ErrorAction Stop
     $trigger = $task.Triggers | Select-Object -First 1
     [PSCustomObject]@{{
         TaskName = $task.TaskName

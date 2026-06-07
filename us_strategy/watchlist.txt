@@ -3,6 +3,7 @@
 # 维护：实盘证券账户持仓快照(2026-06-05) + 手动关注标的。港股不纳入（本仓库为美股策略）。
 
 # ── 手动关注 ──
+US.SPY     # SPDR S&P 500 ETF Trust / 策略基准
 US.AAPL    # Apple
 US.MSFT    # Microsoft
 US.AMZN    # Amazon

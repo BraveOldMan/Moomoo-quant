@@ -8,8 +8,15 @@ from typing import Any
 
 import pandas as pd
 
-from .cache import CachedQuoteContext
-from .diagnostics import correlation_diagnostics, quantile_returns, sign_stability
+from .cache import CachedQuoteContext, SQLiteQuoteContext
+from .diagnostics import (
+    aggregate_ic,
+    correlation_diagnostics,
+    information_coefficient,
+    quantile_returns,
+    sign_stability,
+)
+from .ic_gates import evaluate_ic_gate
 from .market import load_market
 from .optimization import run_optuna_search
 from .panel import build_factor_panel
@@ -24,7 +31,15 @@ from .vectorbt_scan import run_vectorbt_grid
 from .walkforward import run_walk_forward
 
 DEFAULT_STEPS = ("ic", "walkforward")
-CORE_FACTORS = ("capital", "turnover", "momentum")
+CORE_FACTORS = (
+    "capital",
+    "turnover",
+    "momentum",
+    "short",
+    "l2_imbalance",
+    "dark_pool_proxy",
+    "broker",
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,11 +52,7 @@ def main(argv: list[str] | None = None) -> int:
     market = load_market(args.market)
     codes = _parse_codes(args.codes)
     warnings: list[str] = []
-    quote_ctx = CachedQuoteContext(
-        args.cache_dir,
-        quote_ctx_factory=lambda: _open_quote_context(market.config),
-        refresh=args.refresh_cache,
-    )
+    quote_ctx = _make_quote_context(args, market.config)
     try:
         panel = build_factor_panel(
             quote_ctx,
@@ -54,7 +65,14 @@ def main(argv: list[str] | None = None) -> int:
         if panel.empty:
             raise RuntimeError("factor panel is empty; check codes, dates, OpenD, or cache")
         if "ic" in steps:
-            _write_ic_outputs(output_dir, panel)
+            _write_ic_outputs(
+                output_dir,
+                panel,
+                min_days=args.min_ic_days,
+                ic_min=args.ic_min,
+                ir_min=args.ir_min,
+                min_pairs_per_day=args.min_ic_pairs_per_day,
+            )
         if "walkforward" in steps:
             folds = run_walk_forward(
                 market,
@@ -105,12 +123,31 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _write_ic_outputs(output_dir: Path, panel: pd.DataFrame) -> None:
+def _write_ic_outputs(
+    output_dir: Path,
+    panel: pd.DataFrame,
+    min_days: int,
+    ic_min: float,
+    ir_min: float,
+    min_pairs_per_day: int,
+) -> None:
     rows: list[dict[str, Any]] = []
     for factor in CORE_FACTORS:
+        if factor not in panel:
+            continue
         diag = correlation_diagnostics(
             panel[factor].astype(float).tolist(),
             panel["forward_return"].astype(float).tolist(),
+        )
+        daily_ics = _daily_ics(panel, factor, min_pairs=min_pairs_per_day)
+        n_days, mean_ic, std_ic, ir = aggregate_ic(daily_ics)
+        gate = evaluate_ic_gate(
+            n_days=n_days,
+            mean_ic=mean_ic,
+            ir=ir,
+            min_days=min_days,
+            ic_min=ic_min,
+            ir_min=ir_min,
         )
         quantiles = quantile_returns(
             panel[factor].astype(float).tolist(),
@@ -126,13 +163,47 @@ def _write_ic_outputs(output_dir: Path, panel: pd.DataFrame) -> None:
                 "ci_high": diag.ci_high,
                 "hac_t": diag.hac_t,
                 "method": diag.method,
-                "sign_stability": sign_stability([diag.ic], expected_sign=-1),
+                "daily_ic_days": n_days,
+                "daily_mean_ic": mean_ic,
+                "daily_std_ic": std_ic,
+                "daily_ir": ir,
+                "daily_ic_sign_stability": sign_stability(
+                    daily_ics,
+                    expected_sign=-1,
+                ),
+                "gate_status": gate.status,
+                "gate_eligible": gate.eligible,
+                "gate_reason": gate.reason,
                 **{f"q{q}_return": value for q, value in quantiles.items()},
             }
         )
     frame = pd.DataFrame(rows)
     frame.to_csv(output_dir / "ic_diagnostics.csv", index=False, encoding="utf-8")
     write_json(output_dir / "ic_diagnostics.json", rows)
+
+
+def _daily_ics(panel: pd.DataFrame, factor: str, min_pairs: int) -> list[float]:
+    values: list[float] = []
+    for _, day in panel.groupby("date"):
+        if len(day[[factor, "forward_return"]].dropna()) < min_pairs:
+            continue
+        ic = information_coefficient(
+            day[factor].astype(float).tolist(),
+            day["forward_return"].astype(float).tolist(),
+        )
+        if ic == ic:
+            values.append(ic)
+    return values
+
+
+def _make_quote_context(args: argparse.Namespace, config: Any) -> Any:
+    if args.source == "sqlite":
+        return SQLiteQuoteContext(args.sqlite_db)
+    return CachedQuoteContext(
+        args.cache_dir,
+        quote_ctx_factory=lambda: _open_quote_context(config),
+        refresh=args.refresh_cache,
+    )
 
 
 def _open_quote_context(config: Any) -> Any:
@@ -148,6 +219,8 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
     parser.add_argument("--steps", default=",".join(DEFAULT_STEPS))
+    parser.add_argument("--source", choices=("opend", "sqlite"), default="opend")
+    parser.add_argument("--sqlite-db", default="us_strategy/history_data.db")
     parser.add_argument("--cache-dir", default="data/research_cache")
     parser.add_argument("--output-dir", default="report/outputs/signal_research")
     parser.add_argument("--refresh-cache", action="store_true")
@@ -155,6 +228,10 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--n-splits", type=int, default=3)
     parser.add_argument("--n-trials", type=int, default=20)
     parser.add_argument("--min-trades", type=int, default=30)
+    parser.add_argument("--min-ic-days", type=int, default=20)
+    parser.add_argument("--min-ic-pairs-per-day", type=int, default=8)
+    parser.add_argument("--ic-min", type=float, default=0.03)
+    parser.add_argument("--ir-min", type=float, default=0.5)
     return parser.parse_args(argv)
 
 
@@ -176,4 +253,3 @@ def _parse_steps(raw: str) -> list[str]:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

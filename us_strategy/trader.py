@@ -2,6 +2,7 @@
 import logging
 import math
 import time
+from dataclasses import dataclass
 
 import moomoo as ft
 
@@ -10,6 +11,23 @@ from .config import StrategyConfig
 from .data_access import DataAccess
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class ExecutionQualityRecord:
+    """One confirmed order attempt for execution-quality diagnostics."""
+
+    code: str
+    side: str
+    order_type: str
+    requested_qty: int
+    filled_qty: int
+    reference_price: float
+    limit_price: float
+    fill_price: float
+    order_id: str
+    status: str
+    slippage_bps: float | None
 
 
 class Trader:
@@ -30,6 +48,13 @@ class Trader:
         self._trd_env = (
             ft.TrdEnv.REAL if config.trd_env == "REAL" else ft.TrdEnv.SIMULATE
         )
+        self._execution_quality: list[ExecutionQualityRecord] = []
+
+    @property
+    def execution_quality_records(self) -> tuple[ExecutionQualityRecord, ...]:
+        """Return execution-quality records collected since process start."""
+
+        return tuple(self._execution_quality)
 
     # ── 查询 ────────────────────────────────────────────────────────────
     def _positions(self):
@@ -78,10 +103,15 @@ class Trader:
     ) -> tuple[bool, float, int]:
         """买入一批。返回 (是否成功, 成交均价, 成交数量)。
 
-        - 新开仓受 max_positions 限制；加仓不受限。
+        - 新开仓受 max_positions 限制；max_positions <= 0 表示不限制。
+        - 加仓不受 max_positions 限制。
         - use_atr_sizing 时按 ATR 风险预算定量，否则按 position_ratio/批数。
         """
-        if is_new_position and self.count_open_positions() >= self._cfg.max_positions:
+        if (
+            is_new_position
+            and self._cfg.max_positions > 0
+            and self.count_open_positions() >= self._cfg.max_positions
+        ):
             logger.warning(
                 "已达最大持仓数 %d，跳过新开仓 %s", self._cfg.max_positions, code
             )
@@ -108,7 +138,11 @@ class Trader:
         # marketable-limit：愿意以略高于现价成交，兼顾成交率与滑点控制
         limit_price = self._limit_price(current_price, is_buy=True)
         ok, fill_price, filled = self._place_and_confirm(
-            code, qty, ft.TrdSide.BUY, limit_price, fallback=current_price
+            code,
+            qty,
+            ft.TrdSide.BUY,
+            limit_price,
+            reference_price=current_price,
         )
         if ok:
             logger.info("买入成功: %s qty=%d 成交均价=%.3f", code, filled, fill_price)
@@ -123,7 +157,11 @@ class Trader:
 
         limit_price = self._limit_price(current_price, is_buy=False)
         ok, fill_price, filled = self._place_and_confirm(
-            code, qty, ft.TrdSide.SELL, limit_price, fallback=current_price
+            code,
+            qty,
+            ft.TrdSide.SELL,
+            limit_price,
+            reference_price=current_price,
         )
         if ok:
             logger.info("卖出成功: %s qty=%d 成交均价=%.3f", code, filled, fill_price)
@@ -166,7 +204,12 @@ class Trader:
         return round(current_price * (1 - tol), 3)
 
     def _place_and_confirm(
-        self, code: str, qty: int, side, limit_price: float, fallback: float
+        self,
+        code: str,
+        qty: int,
+        side,
+        limit_price: float,
+        reference_price: float,
     ) -> tuple[bool, float, int]:
         use_limit = self._cfg.use_limit_orders and limit_price > 0
         order_type = ft.OrderType.NORMAL if use_limit else ft.OrderType.MARKET
@@ -183,21 +226,61 @@ class Trader:
         self._data.on_order_changed()
         if ret != ft.RET_OK:
             logger.error("下单失败 %s %s: %s", side, code, data)
+            self._record_execution_quality(
+                code=code,
+                side=str(side),
+                order_type=str(order_type),
+                requested_qty=qty,
+                filled_qty=0,
+                reference_price=reference_price,
+                limit_price=price,
+                fill_price=0.0,
+                order_id="",
+                status="SUBMIT_FAILED",
+            )
             return False, 0.0, 0
 
         order_id = _extract(data, "order_id", "")
-        fill_price, filled = self._poll_fill(order_id, fallback, qty)
+        fill_price, filled, status = self._poll_fill_detail(
+            order_id,
+            reference_price,
+            qty,
+        )
+        self._record_execution_quality(
+            code=code,
+            side=str(side),
+            order_type=str(order_type),
+            requested_qty=qty,
+            filled_qty=filled,
+            reference_price=reference_price,
+            limit_price=price,
+            fill_price=fill_price,
+            order_id=str(order_id or ""),
+            status=status,
+        )
         return (filled > 0), fill_price, filled
 
     def _poll_fill(
         self, order_id, fallback_price: float, want_qty: int
     ) -> tuple[float, int]:
         """轮询订单直至成交/超时。返回 (成交均价, 已成交数量)。"""
+        fill_price, filled, _ = self._poll_fill_detail(
+            order_id,
+            fallback_price,
+            want_qty,
+        )
+        return fill_price, filled
+
+    def _poll_fill_detail(
+        self, order_id, fallback_price: float, want_qty: int
+    ) -> tuple[float, int, str]:
+        """轮询订单直至成交/超时，返回成交价、数量和最终状态。"""
         if not order_id:
             logger.error("下单返回缺少 order_id，无法确认成交，按未成交处理")
-            return 0.0, 0
+            return 0.0, 0, "MISSING_ORDER_ID"
         deadline = time.monotonic() + self._cfg.order_fill_timeout_s
         last_price, last_filled = fallback_price, 0
+        last_status = "SUBMITTED"
         while time.monotonic() < deadline:
             ret, df = self._ctx.order_list_query(
                 order_id=order_id, trd_env=self._trd_env
@@ -205,22 +288,53 @@ class Trader:
             if ret == ft.RET_OK and not df.empty:
                 row = df.iloc[0]
                 status = str(row.get("order_status", ""))
+                last_status = status or last_status
                 last_filled = int(_extract(df, "dealt_qty", last_filled) or last_filled)
                 avg = float(_extract(df, "dealt_avg_price", 0) or 0)
                 if avg > 0:
                     last_price = avg
                 if "FILLED_ALL" in status:
-                    return last_price, last_filled or want_qty
+                    return last_price, last_filled or want_qty, status
                 if "CANCELLED" in status or "FAILED" in status or "DELETED" in status:
                     logger.warning(
                         "订单 %s 状态 %s，已成交 %d", order_id, status, last_filled
                     )
-                    return last_price, last_filled
+                    return last_price, last_filled, status
             time.sleep(self._cfg.order_poll_interval_s)
         logger.warning(
             "订单 %s 等待成交超时，已成交 %d/%d", order_id, last_filled, want_qty
         )
-        return last_price, last_filled
+        return last_price, last_filled, f"TIMEOUT:{last_status}"
+
+    def _record_execution_quality(
+        self,
+        code: str,
+        side: str,
+        order_type: str,
+        requested_qty: int,
+        filled_qty: int,
+        reference_price: float,
+        limit_price: float,
+        fill_price: float,
+        order_id: str,
+        status: str,
+    ) -> None:
+        slippage = _slippage_bps(side, reference_price, fill_price, filled_qty)
+        record = ExecutionQualityRecord(
+            code=code,
+            side=side,
+            order_type=order_type,
+            requested_qty=requested_qty,
+            filled_qty=filled_qty,
+            reference_price=reference_price,
+            limit_price=limit_price,
+            fill_price=fill_price,
+            order_id=order_id,
+            status=status,
+            slippage_bps=slippage,
+        )
+        self._execution_quality.append(record)
+        logger.info("执行质量: %s", record)
 
 
 def _extract(df, column: str, default):
@@ -228,3 +342,19 @@ def _extract(df, column: str, default):
         return df[column].iloc[0]
     except (KeyError, TypeError, ValueError, IndexError):
         return default
+
+
+def _slippage_bps(
+    side: str,
+    reference_price: float,
+    fill_price: float,
+    filled_qty: int,
+) -> float | None:
+    if filled_qty <= 0 or reference_price <= 0 or fill_price <= 0:
+        return None
+    side_upper = side.upper()
+    if "BUY" in side_upper:
+        return (fill_price - reference_price) / reference_price * 10_000.0
+    if "SELL" in side_upper:
+        return (reference_price - fill_price) / reference_price * 10_000.0
+    return None

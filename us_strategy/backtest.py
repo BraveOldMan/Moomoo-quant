@@ -196,8 +196,39 @@ class BacktestEngine:
             cf = cf.rename(columns={"capital_flow_item_time": "time_key"})
             keep = [c for c in ("time_key", "main_in_flow") if c in cf.columns]
             kl = kl.merge(cf[keep], on="time_key", how="left")
+        if self._cfg.use_short_metrics:
+            short = self._fetch_short_volume(code, start, end)
+            if not short.empty:
+                kl = kl.merge(short, on="time_key", how="left")
         kl["code"] = code
         return kl
+
+    def _fetch_short_volume(self, code: str, start: str, end: str) -> pd.DataFrame:
+        """Fetch daily short-volume rows when the quote context supports them."""
+
+        if not hasattr(self._ctx, "get_daily_short_volume"):
+            return pd.DataFrame()
+        try:
+            ret, frame = self._ctx.get_daily_short_volume(
+                code,
+                start=start,
+                end=end,
+            )
+        except TypeError:
+            ret, frame = self._ctx.get_daily_short_volume(code)
+        if ret != ft.RET_OK or frame.empty:
+            return pd.DataFrame()
+        frame = frame.rename(columns={"timestamp_str": "time_key"})
+        keep = [c for c in ("time_key", "short_percent") if c in frame.columns]
+        if len(keep) < 2:
+            return pd.DataFrame()
+        out = frame[keep].copy()
+        out.loc[:, "time_key"] = out["time_key"].astype(str).str[:10]
+        out.loc[:, "short_percent"] = pd.to_numeric(
+            out["short_percent"],
+            errors="coerce",
+        )
+        return out
 
     def _fetch_benchmark(self, start: str, end: str) -> dict[str, float]:
         df = self._fetch_one(self._cfg.backtest_benchmark, start, end)
@@ -244,6 +275,7 @@ class BacktestEngine:
                 turnover_usd = float(row.get("turnover") or 0)
                 turnover_rate = float(row.get("turnover_rate") or 0) * 100.0
                 main_flow = float(row.get("main_in_flow") or 0)
+                short_percent = _finite_or_none(row.get("short_percent"))
 
                 h = history.setdefault(
                     code,
@@ -254,6 +286,7 @@ class BacktestEngine:
                         "turnover": [],
                         "turnover_rate": [],
                         "main_flow": [],
+                        "short_percent": [],
                     },
                 )
 
@@ -285,6 +318,7 @@ class BacktestEngine:
                 h["turnover"].append(turnover_usd)
                 h["turnover_rate"].append(turnover_rate)
                 h["main_flow"].append(main_flow)
+                h["short_percent"].append(short_percent)
 
             equity_curve.append(cash + self._holdings_value(positions, all_data, dt))
             if dt_key in bench:
@@ -338,6 +372,13 @@ class BacktestEngine:
             s_ret = (closes[-1] - closes[-1 - lb]) / closes[-1 - lb]
             b_ret = (bench_closes[-1] - bench_closes[-1 - lb]) / bench_closes[-1 - lb]
             scores["rs"] = features.rs_score(s_ret, b_ret)
+        if cfg.use_short_metrics and h.get("short_percent"):
+            short_pct = h["short_percent"][-1]
+            if short_pct is not None and short_pct > 0:
+                short_score = features.short_volume_score(short_pct)
+                scores["short"] = (
+                    100.0 - short_score if cfg.short_squeeze_reverse else short_score
+                )
         return features.score_from_features(scores, weights)
 
     def _apply_decision(
@@ -589,3 +630,11 @@ def _close_at(df: pd.DataFrame, dt, code: str) -> float | None:
 
 def _to_date(value) -> date:
     return date.fromisoformat(str(value)[:10])
+
+
+def _finite_or_none(value) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None

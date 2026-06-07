@@ -2,12 +2,12 @@
 #
 # Runs `python -m us_strategy.forward_monitor`, which scores the watchlist on a
 # loop and persists every factor score into signal_log WITHOUT placing orders.
-# The monitor self-gates US market hours (skips rounds when closed), so this
-# launcher only needs a generous daily window; the scheduled task supplies it.
+# The monitor self-gates US extended hours and only writes signal_log; it never
+# places orders.
 #
 # Registered by: Register-ScheduledTask "MoomooForwardCollect"
-#   Trigger : weekly Mon-Fri 21:00 (Beijing) — covers US RTH in both EDT/EST
-#   Limit   : 9h run window -> stops ~06:00 Beijing, after either DST close
+#   Trigger : weekly Mon-Fri 16:00 (Beijing) — covers US PRE/AFTER in EDT/EST
+#   Limit   : 17h run window -> stops after the US after-hours session
 #
 # Purpose: accumulate (factor scores @T, price @T) so analysis.forward_ic_from_log
 # can calibrate the un-validated microstructure / short / option factors.
@@ -32,7 +32,8 @@ if (-not $conn.TcpTestSucceeded) {
 }
 
 $env:MONITOR_INTERVAL_S = '300'
-Write-Log 'launching forward_monitor (interval=300s)'
+$env:MONITOR_MARKET_SESSIONS = 'PRE,AFTER'
+Write-Log 'launching forward_monitor (interval=300s sessions=PRE,AFTER)'
 # forward_monitor logs to stderr. Redirect via cmd.exe (OS-level >> 2>&1) rather
 # than PowerShell's *>> : under PowerShell 5.1 a native program's stderr is
 # wrapped as a NativeCommandError (noise in the log, and a terminating error

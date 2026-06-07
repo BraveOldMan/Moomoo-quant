@@ -19,6 +19,7 @@
   TRADE_PASSWORD                   实盘解锁密码（REAL 必填）
   IPO_DAYS_WINDOW                  关注上市后 N 天内新股，默认 10
   WATCHLIST / WATCHLIST_FILE       自选港股清单（覆盖 watchlist.txt）
+  TRADE_EXCLUDED_SYMBOLS           仅观察/基准标的，不进入下单 universe
   MIN_DAILY_TURNOVER               流动性过滤阈值（HKD），默认 5,000,000
   POSITION_RATIO / MAX_POSITIONS / ENTRY_TRANCHES   仓位参数
   USE_ATR_SIZING / ATR_RISK_PER_TRADE_PCT           ATR 仓位
@@ -47,7 +48,12 @@ from .config import Signal, StrategyConfig
 from .data_access import DataAccess
 from .market_calendar import get_hkex_holidays, refresh_trading_days_from_api
 from .monitor import RealtimeMonitor
-from .persistence import PositionRecord, PositionStore, SignalLogStore
+from .persistence import (
+    PortfolioValueStore,
+    PositionRecord,
+    PositionStore,
+    SignalLogStore,
+)
 from .signals import SignalCalculator
 from .strategy import IPOStrategy
 from .trader import Trader
@@ -89,6 +95,13 @@ def _is_in_open_cooldown(cfg: StrategyConfig, now: datetime | None = None) -> bo
     market_open_dt = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     elapsed = (now - market_open_dt).total_seconds() / 60.0
     return 0.0 <= elapsed < cfg.open_cooldown_minutes
+
+
+def _tradable_watchlist(cfg: StrategyConfig) -> tuple[str, ...]:
+    """返回自选清单中允许进入交易决策的标的，排除指数/基准等观察项。"""
+
+    excluded = set(cfg.trade_excluded_symbols)
+    return tuple(code for code in cfg.watchlist if code not in excluded)
 
 
 def _fetch_recent_ipos(
@@ -199,6 +212,7 @@ def run() -> None:
     strategy = IPOStrategy(calculator, cfg)
     trader = Trader(trade_ctx, data, cfg)
     store = PositionStore(cfg.db_path)
+    portfolio_values = PortfolioValueStore(cfg.db_path)
     alerts = AlertManager(cfg)
     dark_pool_tracker = None
     if cfg.use_dark_pool_proxy:
@@ -242,18 +256,40 @@ def run() -> None:
     events: queue.Queue = queue.Queue()
     baseline_set_date: dict[str, date] = {}
 
+    def set_circuit_breaker_baseline(today: date, portfolio_value: float) -> None:
+        """Inject the configured daily circuit-breaker baseline once per day."""
+        if baseline_set_date.get("d") == today:
+            return
+        mode = cfg.circuit_breaker_baseline
+        if mode == "prev_close":
+            previous = portfolio_values.latest_before(today)
+            if previous is not None and previous.value > 0:
+                strategy.set_daily_baseline(previous.value)
+                logger.info(
+                    "组合熔断基准使用前一观测日净值: date=%s value=%.2f",
+                    previous.trade_date.isoformat(),
+                    previous.value,
+                )
+            else:
+                logger.warning("缺少前一观测日净值，prev_close 将降级为 first_seen")
+        elif mode == "day_open":
+            strategy.set_daily_baseline(portfolio_value)
+            logger.info("组合熔断基准使用当日首个开盘净值: %.2f", portfolio_value)
+        elif mode != "first_seen":
+            logger.warning("未知组合熔断基准 %s，将降级为 first_seen", mode)
+        baseline_set_date["d"] = today
+
     def process_quote(code: str, price: float) -> None:
         """单线程消费：评估并执行。仅此函数会改写策略状态与下单。"""
         if not _is_market_open(cfg):
             return
 
-        # 每个交易日开盘后首次：注入熔断基准净值
+        # 每个交易日开盘后首次按配置注入熔断基准净值。
         today = market_date(cfg.market_timezone)
-        if baseline_set_date.get("d") != today:
-            pv = trader.get_portfolio_value()
-            if pv > 0:
-                strategy.set_daily_baseline(pv)
-                baseline_set_date["d"] = today
+        pv = trader.get_portfolio_value()
+        if pv > 0:
+            set_circuit_breaker_baseline(today, pv)
+            portfolio_values.save(today, pv)
 
         decision = strategy.evaluate(code, current_price=price)
         logger.info("决策: %s", decision)
@@ -340,14 +376,29 @@ def run() -> None:
     if saved:
         monitor.subscribe(list(saved.keys()))
     # 自选 universe（非 IPO 的通用港股）：启动即订阅，全程纳入分析
-    if cfg.watchlist:
-        monitor.subscribe(list(cfg.watchlist))
-        logger.info("自选 universe %d 只: %s", len(cfg.watchlist), list(cfg.watchlist))
+    tradable_watchlist = _tradable_watchlist(cfg)
+    excluded_watchlist = tuple(
+        code for code in cfg.watchlist if code in set(cfg.trade_excluded_symbols)
+    )
+    if tradable_watchlist:
+        monitor.subscribe(list(tradable_watchlist))
+        logger.info(
+            "自选交易 universe %d 只: %s",
+            len(tradable_watchlist),
+            list(tradable_watchlist),
+        )
+    if excluded_watchlist:
+        logger.info(
+            "仅观察/基准标的已排除出下单 universe: %s", list(excluded_watchlist)
+        )
 
     try:
         while True:
             pv = trader.get_portfolio_value()
             if pv > 0:
+                today = market_date(cfg.market_timezone)
+                set_circuit_breaker_baseline(today, pv)
+                portfolio_values.save(today, pv)
                 if strategy.check_and_update_circuit_breaker(pv):
                     alerts.send(
                         "组合熔断",
@@ -366,7 +417,9 @@ def run() -> None:
 
             # universe = IPO 扫描 ∪ 自选清单 ∪ 现有持仓
             all_codes = (
-                set(ipo_map.keys()) | set(cfg.watchlist) | strategy.get_active_codes()
+                set(ipo_map.keys())
+                | set(tradable_watchlist)
+                | strategy.get_active_codes()
             )
             for code in all_codes:
                 price, _ = _get_snapshot(data, code)

@@ -13,6 +13,7 @@ from tools.backfill_moomoo_us_history import HistoryStore
 from tools.daily_moomoo_watchlist_backfill import (
     MarketJob,
     MarketSpec,
+    build_jobs,
     fetch_market_snapshots,
     hk_status_snapshot_record,
 )
@@ -83,6 +84,35 @@ def test_fetch_market_snapshots_stores_hk_status_table(tmp_path: Path) -> None:
         )
     finally:
         conn.close()
+
+
+def test_build_jobs_merges_us_proxy_watchlist(tmp_path: Path) -> None:
+    us_watchlist = tmp_path / "us_watchlist.txt"
+    proxy_watchlist = tmp_path / "proxy_watchlist.txt"
+    hk_watchlist = tmp_path / "hk_watchlist.txt"
+    us_watchlist.write_text("US.AAPL\nUS.QQQ\n", encoding="utf-8")
+    proxy_watchlist.write_text("US.SPY\nUS.QQQ\nUS.IBIT\n", encoding="utf-8")
+    hk_watchlist.write_text("", encoding="utf-8")
+    args = type(
+        "Args",
+        (),
+        {
+            "watchlist": "",
+            "us_watchlist": str(us_watchlist),
+            "us_proxy_watchlist": str(proxy_watchlist),
+            "hk_watchlist": str(hk_watchlist),
+            "markets": "US",
+            "codes": "",
+            "date": "2026-06-05",
+            "after_close_delay_min": 90,
+            "force": False,
+        },
+    )()
+
+    jobs = build_jobs(args)
+
+    assert len(jobs) == 1
+    assert jobs[0].codes == ("US.AAPL", "US.QQQ", "US.SPY", "US.IBIT")
 
 
 class _FakeApi:

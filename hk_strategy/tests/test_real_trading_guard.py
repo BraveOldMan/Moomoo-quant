@@ -24,6 +24,16 @@ def test_from_env_defaults_to_simulate_without_real_flag(monkeypatch):
     assert cfg.allow_real_trading is False
 
 
+@pytest.mark.parametrize("value", ["simulate", "Simulate", " SIMULATE ", ""])
+def test_trade_env_is_normalized_to_simulate(monkeypatch, value):
+    _clear_trade_env(monkeypatch)
+    monkeypatch.setenv("TRADE_ENV", value)
+
+    cfg = StrategyConfig.from_env()
+
+    assert cfg.trd_env == "SIMULATE"
+
+
 @pytest.mark.parametrize(
     "value,expected",
     [

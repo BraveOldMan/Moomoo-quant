@@ -20,7 +20,7 @@ function Write-Log($message) {
 }
 
 Write-Log 'launching daily_moomoo_watchlist_backfill'
-& cmd /c "`"$py`" -u -m tools.daily_moomoo_watchlist_backfill --db us_strategy\history_data.db --us-watchlist us_strategy\watchlist.txt --hk-watchlist hk_strategy\watchlist.txt --markets US,HK --history-start 2024-01-01 --sleep 0.2 --after-close-delay-min 90 >> `"$log`" 2>&1"
+& cmd /c "`"$py`" -u -m tools.daily_moomoo_watchlist_backfill --db us_strategy\history_data.db --us-watchlist us_strategy\watchlist.txt --us-proxy-watchlist us_strategy\proxy_watchlist.txt --hk-watchlist hk_strategy\watchlist.txt --markets US,HK --history-start 2024-01-01 --sleep 0.2 --after-close-delay-min 90 >> `"$log`" 2>&1"
 $exitCode = $LASTEXITCODE
 Write-Log "daily_moomoo_watchlist_backfill exited (code=$exitCode)"
 

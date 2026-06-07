@@ -31,14 +31,22 @@ def _bars(
 
 
 class _Quote:
-    def __init__(self, data: dict[str, pd.DataFrame]) -> None:
+    def __init__(
+        self,
+        data: dict[str, pd.DataFrame],
+        short_data: dict[str, pd.DataFrame] | None = None,
+    ) -> None:
         self._data = data
+        self._short_data = short_data or {}
 
     def request_history_kline(self, code: str, **_kwargs):
         return ft.RET_OK, self._data.get(code, pd.DataFrame()).copy(), None
 
     def get_capital_flow(self, *_args, **_kwargs):
         return ft.RET_OK, pd.DataFrame()
+
+    def get_daily_short_volume(self, code: str, **_kwargs):
+        return ft.RET_OK, self._short_data.get(code, pd.DataFrame()).copy()
 
 
 def test_backtest_uses_prior_history_for_entry_signal() -> None:
@@ -102,3 +110,65 @@ def test_backtest_macro_filter_blocks_new_buys() -> None:
     )
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]
+
+
+def test_backtest_short_factor_can_block_new_buys() -> None:
+    bars = _bars("US.TEST", closes=[10.0, 10.2, 10.4, 10.6])
+    short = pd.DataFrame(
+        {
+            "timestamp_str": bars["time_key"],
+            "short_percent": [25.0, 25.0, 25.0, 25.0],
+        }
+    )
+    quote = _Quote(
+        {"US.TEST": bars, "US.SPY": _bars("US.SPY", closes=[10.0, 10.1, 10.2, 10.3])},
+        {"US.TEST": short},
+    )
+    cfg = StrategyConfig(
+        entry_tranches=1,
+        use_short_metrics=True,
+        w_turnover=0.0,
+        w_capital=0.0,
+        w_momentum=0.0,
+        w_short=1.0,
+        buy_threshold=35.0,
+    )
+
+    result = BacktestEngine(quote, cfg).run(
+        ["US.TEST"],
+        "2024-01-02",
+        "2024-01-05",
+    )
+
+    assert not [trade for trade in result.trades if trade.side == "BUY"]
+
+
+def test_backtest_short_factor_allows_low_short_new_buys() -> None:
+    bars = _bars("US.TEST", closes=[10.0, 10.2, 10.4, 10.6])
+    short = pd.DataFrame(
+        {
+            "timestamp_str": bars["time_key"],
+            "short_percent": [1.0, 1.0, 1.0, 1.0],
+        }
+    )
+    quote = _Quote(
+        {"US.TEST": bars, "US.SPY": _bars("US.SPY", closes=[10.0, 10.1, 10.2, 10.3])},
+        {"US.TEST": short},
+    )
+    cfg = StrategyConfig(
+        entry_tranches=1,
+        use_short_metrics=True,
+        w_turnover=0.0,
+        w_capital=0.0,
+        w_momentum=0.0,
+        w_short=1.0,
+        buy_threshold=35.0,
+    )
+
+    result = BacktestEngine(quote, cfg).run(
+        ["US.TEST"],
+        "2024-01-02",
+        "2024-01-05",
+    )
+
+    assert [trade for trade in result.trades if trade.side == "BUY"]

@@ -1,0 +1,8 @@
+# US proxy symbols for research filters and benchmarks.
+# Loaded by tools.daily_moomoo_watchlist_backfill via --us-proxy-watchlist.
+
+US.SPY     # S&P 500 / default backtest benchmark
+US.QQQ     # Nasdaq 100 risk-on proxy
+US.VIXY    # VIX futures ETF risk-off proxy
+US.UVXY    # VIX futures leveraged ETF fallback
+US.IBIT    # Spot Bitcoin ETF proxy for crypto-linked stocks

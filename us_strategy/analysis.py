@@ -113,6 +113,7 @@ def forward_ic_from_log(
     factor: str,
     horizon_seconds: float,
     method: str = "spearman",
+    market_session: str | None = None,
 ) -> ICSummary:
     """从 SignalLogStore 记录计算前向 IC。
 
@@ -121,10 +122,14 @@ def forward_ic_from_log(
     有效（风险分高→收益低）应得显著负 IC。
 
     records：SignalLogRecord 列表（需含 ts/code/last_price/scores）。
+    market_session：可选过滤 PRE/RTH/AFTER，避免扩展时段与常规时段混算。
     """
+    session_filter = str(market_session).upper() if market_session else None
     by_code: dict[str, list] = {}
     for r in records:
         if factor not in getattr(r, "scores", {}):
+            continue
+        if session_filter and getattr(r, "market_session", "").upper() != session_filter:
             continue
         by_code.setdefault(r.code, []).append(r)
 

@@ -80,7 +80,15 @@ def run_walk_forward(
 
 def _mean_core_ic(panel: pd.DataFrame) -> float:
     vals: list[float] = []
-    for factor in ("capital", "turnover", "momentum"):
+    for factor in (
+        "capital",
+        "turnover",
+        "momentum",
+        "short",
+        "l2_imbalance",
+        "dark_pool_proxy",
+        "broker",
+    ):
         if factor not in panel or panel.empty:
             continue
         diag = correlation_diagnostics(
@@ -91,4 +99,3 @@ def _mean_core_ic(panel: pd.DataFrame) -> float:
         if diag.ic == diag.ic:
             vals.append(diag.ic)
     return statistics.mean(vals) if vals else float("nan")
-

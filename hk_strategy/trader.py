@@ -5,6 +5,8 @@ import time
 
 import moomoo as ft
 
+from order_book_l2 import compute_order_book_metrics
+
 from . import features
 from .config import StrategyConfig
 from .data_access import DataAccess
@@ -78,10 +80,15 @@ class Trader:
     ) -> tuple[bool, float, int]:
         """买入一批。返回 (是否成功, 成交均价, 成交数量)。
 
-        - 新开仓受 max_positions 限制；加仓不受限。
+        - 新开仓受 max_positions 限制；max_positions <= 0 表示不限制。
+        - 加仓不受 max_positions 限制。
         - use_atr_sizing 时按 ATR 风险预算定量，否则按 position_ratio/批数。
         """
-        if is_new_position and self.count_open_positions() >= self._cfg.max_positions:
+        if (
+            is_new_position
+            and self._cfg.max_positions > 0
+            and self.count_open_positions() >= self._cfg.max_positions
+        ):
             logger.warning(
                 "已达最大持仓数 %d，跳过新开仓 %s", self._cfg.max_positions, code
             )
@@ -103,6 +110,8 @@ class Trader:
             logger.warning(
                 "资金不足或仓位为零，跳过买入 %s (price=%.3f)", code, current_price
             )
+            return False, 0.0, 0
+        if self._execution_liquidity_blocked(code, qty):
             return False, 0.0, 0
 
         # marketable-limit：愿意以略高于现价成交，兼顾成交率与滑点控制
@@ -164,6 +173,44 @@ class Trader:
         if is_buy:
             return round(current_price * (1 + tol), 3)
         return round(current_price * (1 - tol), 3)
+
+    def _execution_liquidity_blocked(self, code: str, qty: int) -> bool:
+        """Fail closed when visible L2 liquidity is too thin for a buy."""
+        cfg = self._cfg
+        if not cfg.use_order_book_metrics:
+            return False
+        try:
+            ret, book = self._data.get_order_book(code, cfg.order_book_levels)
+        except Exception as exc:
+            logger.warning("执行盘口检查异常 %s: %s", code, exc)
+            return True
+        if ret != ft.RET_OK or not isinstance(book, dict):
+            logger.warning("执行盘口检查失败 %s: %s", code, book)
+            return True
+        metrics = compute_order_book_metrics(
+            book,
+            slippage_qty=max(float(qty), cfg.order_book_slippage_qty),
+        )
+        spread_bps = _finite_or_none(metrics.get("spread_bps"))
+        buy_slippage_bps = _finite_or_none(metrics.get("estimated_buy_slippage_bps"))
+        if spread_bps is None or buy_slippage_bps is None:
+            logger.warning("执行盘口检查缺少 spread/slippage，跳过买入 %s", code)
+            return True
+        if spread_bps >= cfg.order_book_spread_danger_bps:
+            logger.warning(
+                "执行盘口价差过大，跳过买入 %s spread=%.1fbps",
+                code,
+                spread_bps,
+            )
+            return True
+        if buy_slippage_bps >= cfg.order_book_slippage_danger_bps:
+            logger.warning(
+                "执行盘口买入滑点过大，跳过买入 %s slippage=%.1fbps",
+                code,
+                buy_slippage_bps,
+            )
+            return True
+        return False
 
     def _place_and_confirm(
         self, code: str, qty: int, side, limit_price: float, fallback: float
@@ -228,3 +275,11 @@ def _extract(df, column: str, default):
         return df[column].iloc[0]
     except (KeyError, TypeError, ValueError, IndexError):
         return default
+
+
+def _finite_or_none(value) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None

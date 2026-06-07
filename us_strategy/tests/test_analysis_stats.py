@@ -4,10 +4,12 @@
 import pytest
 
 from us_strategy.analysis import (
+    forward_ic_from_log,
     information_coefficient,
     quantile_returns,
     summarize_ic,
 )
+from us_strategy.persistence import SignalLogRecord
 
 
 def test_ic_perfect_negative():
@@ -55,3 +57,46 @@ def test_quantile_returns_monotonic():
 
 def test_quantile_returns_insufficient():
     assert quantile_returns([1, 2], [1, 2], n_quantiles=5) == {}
+
+
+def test_forward_ic_filters_market_session():
+    records = [
+        SignalLogRecord(
+            ts="2026-06-05T08:00:00+00:00",
+            code="US.A",
+            last_price=10.0,
+            scores={"order_flow": 10.0},
+            market_session="PRE",
+        ),
+        SignalLogRecord(
+            ts="2026-06-05T08:05:00+00:00",
+            code="US.A",
+            last_price=11.0,
+            scores={"order_flow": 20.0},
+            market_session="PRE",
+        ),
+        SignalLogRecord(
+            ts="2026-06-05T14:00:00+00:00",
+            code="US.A",
+            last_price=20.0,
+            scores={"order_flow": 90.0},
+            market_session="RTH",
+        ),
+        SignalLogRecord(
+            ts="2026-06-05T14:05:00+00:00",
+            code="US.A",
+            last_price=18.0,
+            scores={"order_flow": 80.0},
+            market_session="RTH",
+        ),
+    ]
+
+    summary = forward_ic_from_log(
+        records,
+        "order_flow",
+        horizon_seconds=300,
+        market_session="PRE",
+    )
+
+    assert summary.n == 1
+    assert summary.ic == pytest.approx(0.0)

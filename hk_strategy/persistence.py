@@ -100,6 +100,81 @@ class PositionStore:
         }
 
 
+@dataclass(frozen=True)
+class PortfolioValueRecord:
+    """One observed portfolio value for a market date."""
+
+    trade_date: date
+    value: float
+    updated_at: str
+
+
+class PortfolioValueStore:
+    """Persist portfolio values so prev-close circuit breakers survive restarts."""
+
+    def __init__(self, db_path: str = "hk_strategy/positions.db"):
+        Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+        self._path = db_path
+        self._init_db()
+
+    @contextmanager
+    def _conn(self):
+        conn = sqlite3.connect(self._path)
+        try:
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _init_db(self) -> None:
+        with self._conn() as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS portfolio_values (
+                    trade_date TEXT PRIMARY KEY,
+                    value      REAL NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+    def save(self, trade_date: date, value: float) -> None:
+        """Save the latest positive portfolio value for one market date."""
+        if value <= 0:
+            return
+        updated_at = datetime.now(timezone.utc).isoformat()
+        with self._conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO portfolio_values (trade_date, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(trade_date) DO UPDATE SET
+                    value      = excluded.value,
+                    updated_at = excluded.updated_at
+                """,
+                (trade_date.isoformat(), value, updated_at),
+            )
+
+    def latest_before(self, trade_date: date) -> PortfolioValueRecord | None:
+        """Return the latest saved value before `trade_date`, if available."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT trade_date, value, updated_at
+                  FROM portfolio_values
+                 WHERE trade_date < ?
+                 ORDER BY trade_date DESC
+                 LIMIT 1
+                """,
+                (trade_date.isoformat(),),
+            ).fetchone()
+        if row is None:
+            return None
+        return PortfolioValueRecord(
+            trade_date=date.fromisoformat(row[0]),
+            value=float(row[1]),
+            updated_at=str(row[2]),
+        )
+
+
 @dataclass
 class SignalLogRecord:
     ts: str  # ISO8601 UTC 时间戳

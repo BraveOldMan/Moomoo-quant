@@ -106,6 +106,7 @@ class SignalLogRecord:
     code: str
     last_price: float
     scores: dict[str, float]  # 各因子风险分快照
+    market_session: str = "RTH"
 
 
 class SignalLogStore:
@@ -138,23 +139,43 @@ class SignalLogStore:
                     ts         TEXT NOT NULL,
                     code       TEXT NOT NULL,
                     last_price REAL NOT NULL,
-                    scores     TEXT NOT NULL
+                    scores     TEXT NOT NULL,
+                    market_session TEXT NOT NULL DEFAULT 'RTH'
                 )
             """)
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(signal_log)")}
+            if "market_session" not in cols:
+                conn.execute(
+                    "ALTER TABLE signal_log "
+                    "ADD COLUMN market_session TEXT NOT NULL DEFAULT 'RTH'"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_signal_log_code ON signal_log(code, ts)"
             )
 
-    def log(self, code: str, last_price: float, scores: dict[str, float]) -> None:
+    def log(
+        self,
+        code: str,
+        last_price: float,
+        scores: dict[str, float],
+        market_session: str = "RTH",
+    ) -> None:
         ts = datetime.now(timezone.utc).isoformat()
         with self._conn() as conn:
             conn.execute(
-                "INSERT INTO signal_log (ts, code, last_price, scores) VALUES (?,?,?,?)",
-                (ts, code, last_price, json.dumps(scores)),
+                "INSERT INTO signal_log "
+                "(ts, code, last_price, scores, market_session) VALUES (?,?,?,?,?)",
+                (
+                    ts,
+                    code,
+                    last_price,
+                    json.dumps(scores),
+                    _normalize_market_session(market_session),
+                ),
             )
 
     def load(self, code: str | None = None) -> list[SignalLogRecord]:
-        sql = "SELECT ts, code, last_price, scores FROM signal_log"
+        sql = "SELECT ts, code, last_price, scores, market_session FROM signal_log"
         params: tuple = ()
         if code is not None:
             sql += " WHERE code = ?"
@@ -164,7 +185,16 @@ class SignalLogStore:
             rows = conn.execute(sql, params).fetchall()
         return [
             SignalLogRecord(
-                ts=r[0], code=r[1], last_price=r[2], scores=json.loads(r[3])
+                ts=r[0],
+                code=r[1],
+                last_price=r[2],
+                scores=json.loads(r[3]),
+                market_session=_normalize_market_session(r[4]),
             )
             for r in rows
         ]
+
+
+def _normalize_market_session(value: str | None) -> str:
+    session = str(value or "RTH").strip().upper()
+    return session if session else "RTH"

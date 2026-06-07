@@ -5,7 +5,7 @@
   1. 评分与实盘共用 features.score_from_features + 同一套因子权重，杜绝
      "测的不是跑的"。
   2. 成本模型：佣金（每股 + 最低）+ 滑点（基点），买卖均扣。
-  3. 基准对比：SPY buy&hold 同期收益。
+  3. 基准对比：配置的港股基准 buy&hold 同期收益。
   4. 风险指标：年化收益、Sharpe、Sortino、Calmar、最大回撤。
   5. walk-forward：按时间切分样本外检验，抑制过拟合。
   6. look-ahead 安全：逐日只用截至当日的历史窗口计算因子。
@@ -52,6 +52,7 @@ class BacktestResult:
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
     benchmark_curve: list[float] = field(default_factory=list)
+    benchmark_label: str = "benchmark buy&hold"
 
     @property
     def total_return_pct(self) -> float:
@@ -153,7 +154,7 @@ class BacktestResult:
             f"初始资金:   ${self.initial_cash:>14,.2f}",
             f"最终净值:   ${self.final_value:>14,.2f}",
             f"总收益率:   {self.total_return_pct:>+8.2f}%",
-            f"基准收益:   {self.benchmark_return_pct:>+8.2f}%  (SPY buy&hold)",
+            f"基准收益:   {self.benchmark_return_pct:>+8.2f}%  ({self.benchmark_label})",
             f"超额 Alpha: {self.alpha_pct:>+8.2f}%",
             f"年化收益:   {self.annualized_return_pct:>+8.2f}%",
             f"最大回撤:   {self.max_drawdown_pct:>8.2f}%",
@@ -196,8 +197,36 @@ class BacktestEngine:
             cf = cf.rename(columns={"capital_flow_item_time": "time_key"})
             keep = [c for c in ("time_key", "main_in_flow") if c in cf.columns]
             kl = kl.merge(cf[keep], on="time_key", how="left")
+        if self._cfg.use_short_metrics:
+            short = self._fetch_short_volume(code, start, end)
+            if not short.empty:
+                kl = kl.merge(short, on="time_key", how="left")
         kl["code"] = code
         return kl
+
+    def _fetch_short_volume(self, code: str, start: str, end: str) -> pd.DataFrame:
+        """Fetch daily short-volume rows when the quote context supports them."""
+        if not hasattr(self._ctx, "get_daily_short_volume"):
+            return pd.DataFrame()
+        try:
+            ret, frame = self._ctx.get_daily_short_volume(
+                code,
+                start=start,
+                end=end,
+            )
+        except TypeError:
+            ret, frame = self._ctx.get_daily_short_volume(code)
+        if ret != ft.RET_OK or frame.empty:
+            return pd.DataFrame()
+        frame = frame.rename(columns={"timestamp_str": "time_key"})
+        keep = [c for c in ("time_key", "short_percent") if c in frame.columns]
+        if len(keep) < 2:
+            return pd.DataFrame()
+        out = frame.loc[:, keep].copy()
+        return out.assign(
+            time_key=out["time_key"].astype(str).str[:10],
+            short_percent=pd.to_numeric(out["short_percent"], errors="coerce"),
+        )
 
     def _fetch_benchmark(self, start: str, end: str) -> dict[str, float]:
         df = self._fetch_one(self._cfg.backtest_benchmark, start, end)
@@ -244,6 +273,7 @@ class BacktestEngine:
                 turnover_usd = float(row.get("turnover") or 0)
                 turnover_rate = float(row.get("turnover_rate") or 0) * 100.0
                 main_flow = float(row.get("main_in_flow") or 0)
+                short_percent = _finite_or_none(row.get("short_percent"))
 
                 h = history.setdefault(
                     code,
@@ -254,6 +284,7 @@ class BacktestEngine:
                         "turnover": [],
                         "turnover_rate": [],
                         "main_flow": [],
+                        "short_percent": [],
                     },
                 )
 
@@ -283,6 +314,7 @@ class BacktestEngine:
                 h["turnover"].append(turnover_usd)
                 h["turnover_rate"].append(turnover_rate)
                 h["main_flow"].append(main_flow)
+                h["short_percent"].append(short_percent)
 
             equity_curve.append(cash + self._holdings_value(positions, all_data, dt))
             if dt_key in bench:
@@ -308,7 +340,12 @@ class BacktestEngine:
                     )
 
         return BacktestResult(
-            self._initial_cash, cash, trades, equity_curve, benchmark_curve
+            self._initial_cash,
+            cash,
+            trades,
+            equity_curve,
+            benchmark_curve,
+            f"{self._cfg.backtest_benchmark} buy&hold",
         )
 
     def _score(self, code, h, bench_closes, weights) -> float:
@@ -336,6 +373,13 @@ class BacktestEngine:
             s_ret = (closes[-1] - closes[-1 - lb]) / closes[-1 - lb]
             b_ret = (bench_closes[-1] - bench_closes[-1 - lb]) / bench_closes[-1 - lb]
             scores["rs"] = features.rs_score(s_ret, b_ret)
+        if cfg.use_short_metrics and h.get("short_percent"):
+            short_pct = h["short_percent"][-1]
+            if short_pct is not None and short_pct > 0:
+                short_score = features.short_volume_score(short_pct)
+                scores["short"] = (
+                    100.0 - short_score if cfg.short_squeeze_reverse else short_score
+                )
         return features.score_from_features(scores, weights)
 
     def _apply_decision(
@@ -376,7 +420,7 @@ class BacktestEngine:
             return self._exit(dt, code, close, cash, positions, trades), True
 
         # 买入（含加仓）
-        can_open = in_pos or len(positions) < cfg.max_positions
+        can_open = in_pos or cfg.max_positions <= 0 or len(positions) < cfg.max_positions
         liquidity_ok = turnover_usd >= cfg.min_daily_turnover
         if (
             score < cfg.buy_threshold
@@ -568,3 +612,11 @@ def _close_at(df: pd.DataFrame, dt, code: str) -> float | None:
 
 def _to_date(value) -> date:
     return date.fromisoformat(str(value)[:10])
+
+
+def _finite_or_none(value) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None

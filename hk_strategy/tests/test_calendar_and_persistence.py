@@ -4,7 +4,11 @@
 from datetime import date
 
 from hk_strategy.market_calendar import get_hkex_holidays, is_trading_day
-from hk_strategy.persistence import PositionRecord, PositionStore
+from hk_strategy.persistence import (
+    PortfolioValueStore,
+    PositionRecord,
+    PositionStore,
+)
 
 
 # ── 交易日历（仅断言高置信度的固定/已确认假日）──────────────────────────
@@ -80,3 +84,24 @@ def test_position_store_delete(tmp_path):
     store.save(PositionRecord("HK.X", 10, date(2024, 1, 2), 1, 10, 100))
     store.delete("HK.X")
     assert store.load_all() == {}
+
+
+def test_portfolio_value_store_loads_latest_before_date(tmp_path):
+    db = str(tmp_path / "pos.db")
+    store = PortfolioValueStore(db)
+    store.save(date(2024, 1, 2), 100_000.0)
+    store.save(date(2024, 1, 3), 101_000.0)
+
+    previous = store.latest_before(date(2024, 1, 4))
+
+    assert previous is not None
+    assert previous.trade_date == date(2024, 1, 3)
+    assert previous.value == 101_000.0
+
+
+def test_portfolio_value_store_ignores_non_positive_values(tmp_path):
+    db = str(tmp_path / "pos.db")
+    store = PortfolioValueStore(db)
+    store.save(date(2024, 1, 2), 0.0)
+
+    assert store.latest_before(date(2024, 1, 3)) is None

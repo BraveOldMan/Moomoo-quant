@@ -31,14 +31,22 @@ def _bars(
 
 
 class _Quote:
-    def __init__(self, data: dict[str, pd.DataFrame]) -> None:
+    def __init__(
+        self,
+        data: dict[str, pd.DataFrame],
+        short_volume: dict[str, pd.DataFrame] | None = None,
+    ) -> None:
         self._data = data
+        self._short_volume = short_volume or {}
 
     def request_history_kline(self, code: str, **_kwargs):
         return ft.RET_OK, self._data.get(code, pd.DataFrame()).copy(), None
 
     def get_capital_flow(self, *_args, **_kwargs):
         return ft.RET_OK, pd.DataFrame()
+
+    def get_daily_short_volume(self, code: str, **_kwargs):
+        return ft.RET_OK, self._short_volume.get(code, pd.DataFrame()).copy()
 
 
 def test_backtest_uses_prior_history_for_entry_signal() -> None:
@@ -70,6 +78,26 @@ def test_backtest_respects_max_positions() -> None:
     buy_codes = {trade.code for trade in result.trades if trade.side == "BUY"}
 
     assert len(buy_codes) == 1
+
+
+def test_backtest_max_positions_zero_allows_unlimited_positions() -> None:
+    quote = _Quote(
+        {
+            "HK.A": _bars("HK.A"),
+            "HK.B": _bars("HK.B"),
+            "HK.800000": _bars("HK.800000"),
+        }
+    )
+    cfg = StrategyConfig(
+        entry_tranches=1, max_positions=0, min_daily_turnover=1_000_000
+    )
+    result = BacktestEngine(quote, cfg).run(
+        ["HK.A", "HK.B"], "2024-01-02", "2024-01-04"
+    )
+
+    buy_codes = {trade.code for trade in result.trades if trade.side == "BUY"}
+
+    assert buy_codes == {"HK.A", "HK.B"}
 
 
 def test_backtest_respects_liquidity_filter() -> None:
@@ -107,3 +135,46 @@ def test_backtest_hk_futures_filter_blocks_new_buys() -> None:
     )
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]
+
+
+def test_backtest_short_factor_uses_prior_day_short_volume() -> None:
+    quote = _Quote(
+        {
+            "HK.TEST": _bars("HK.TEST"),
+            "HK.800000": _bars("HK.800000"),
+        },
+        short_volume={
+            "HK.TEST": pd.DataFrame(
+                {
+                    "timestamp_str": ["2024-01-02", "2024-01-03"],
+                    "short_percent": [60.0, 60.0],
+                }
+            )
+        },
+    )
+    cfg = StrategyConfig(
+        use_short_metrics=True,
+        w_turnover=0.0,
+        w_capital=0.0,
+        w_momentum=0.0,
+        w_short=1.0,
+        entry_tranches=1,
+        min_daily_turnover=1_000_000,
+        buy_threshold=50.0,
+    )
+
+    result = BacktestEngine(quote, cfg).run(
+        ["HK.TEST"], "2024-01-02", "2024-01-04"
+    )
+
+    assert not [trade for trade in result.trades if trade.side == "BUY"]
+
+
+def test_backtest_report_uses_hk_benchmark_label() -> None:
+    quote = _Quote({"HK.TEST": _bars("HK.TEST"), "HK.800000": _bars("HK.800000")})
+    result = BacktestEngine(quote, StrategyConfig()).run(
+        ["HK.TEST"], "2024-01-02", "2024-01-04"
+    )
+
+    assert "HK.800000 buy&hold" in result.report()
+    assert "SPY buy&hold" not in result.report()

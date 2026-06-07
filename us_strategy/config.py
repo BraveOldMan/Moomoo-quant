@@ -16,6 +16,11 @@ def _csv_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(x.strip() for x in raw.split(",") if x.strip())
 
 
+def _trade_env_from_env() -> str:
+    """读取交易环境并规范成大写；空值回退模拟盘。"""
+    return (os.environ.get("TRADE_ENV", "SIMULATE").strip() or "SIMULATE").upper()
+
+
 def _load_watchlist() -> tuple:
     """加载观察列表：WATCHLIST 环境变量优先，否则回退到 watchlist.txt。
 
@@ -77,7 +82,7 @@ class StrategyConfig:
 
     # ── 仓位管理 ────────────────────────────────────────────────────────
     position_ratio: float = 0.2  # 满仓时每只股占购买力比例
-    max_positions: int = 3  # 最多同时持仓股票数
+    max_positions: int = 3  # 最多同时持仓股票数；<=0 表示不限制
     entry_tranches: int = 2  # 分批买入笔数（1=一次性全仓）
     exit_tranches: int = 1  # 分批卖出笔数（1=一次性清仓）
 
@@ -251,6 +256,8 @@ class StrategyConfig:
     alert_smtp_password: str = ""
     telegram_token: str = ""  # Telegram Bot Token，空表示不发送
     telegram_chat_id: str = ""
+    feishu_chat_id: str = ""  # 飞书群 chat_id，空表示不发送
+    lark_cli: str = "lark-cli"  # lark-cli 命令或绝对路径
 
     @classmethod
     def from_env(cls) -> "StrategyConfig":
@@ -261,7 +268,7 @@ class StrategyConfig:
             host=os.environ.get("OPEND_HOST", "127.0.0.1"),
             port=int(os.environ.get("OPEND_PORT", "11111")),
             trade_password=os.environ.get("TRADE_PASSWORD", ""),
-            trd_env=os.environ.get("TRADE_ENV", "SIMULATE"),
+            trd_env=_trade_env_from_env(),
             allow_real_trading=os.environ.get("ALLOW_REAL_TRADING", "").lower()
             in ("yes", "true", "1"),
             ipo_days_window=int(os.environ.get("IPO_DAYS_WINDOW", "10")),
@@ -392,6 +399,9 @@ class StrategyConfig:
             alert_smtp_password=os.environ.get("SMTP_PASSWORD", ""),
             telegram_token=os.environ.get("TELEGRAM_TOKEN", ""),
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+            feishu_chat_id=os.environ.get("FEISHU_CHAT_ID")
+            or os.environ.get("LARK_CHAT_ID", ""),
+            lark_cli=os.environ.get("LARK_CLI", "lark-cli"),
         )
 
     def active_weights(self) -> dict[str, float]:

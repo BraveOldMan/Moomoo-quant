@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from research.run_backtest_report import (
+    _parse_args,
     metrics_from_result,
     render_markdown,
     write_backtest_outputs,
@@ -69,3 +70,22 @@ def test_write_backtest_outputs_creates_report_package(tmp_path: Path) -> None:
     assert all(path.exists() for path in paths)
     assert "Backtest Report" in render_markdown(metrics, [metrics])
     assert "US.AAPL" in (tmp_path / "trades.csv").read_text(encoding="utf-8")
+
+
+def test_parse_args_accepts_benchmark_override() -> None:
+    args = _parse_args(
+        [
+            "--market",
+            "hk",
+            "--codes",
+            "HK.00700",
+            "--start",
+            "2024-01-02",
+            "--end",
+            "2024-01-31",
+            "--benchmark-code",
+            "HK.02800",
+        ]
+    )
+
+    assert args.benchmark_code == "HK.02800"

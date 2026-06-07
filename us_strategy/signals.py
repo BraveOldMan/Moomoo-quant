@@ -87,7 +87,10 @@ class SignalCalculator:
         self._listing_dates.update(dates)
 
     def calculate(
-        self, code: str, last_price: float | None = None
+        self,
+        code: str,
+        last_price: float | None = None,
+        market_session: str = "RTH",
     ) -> SignalResult | None:
         cfg = self._cfg
         ret, snap = self._data.get_market_snapshot(code)
@@ -262,7 +265,12 @@ class SignalCalculator:
         # 前向日志：记录各因子分 + 当时价格，供 analysis 前向 IC 校准（尤其 CVD/OBI）
         if self._signal_log is not None and last_price:
             try:
-                self._signal_log.log(code, last_price, scores)
+                self._signal_log.log(
+                    code,
+                    last_price,
+                    scores,
+                    market_session=market_session,
+                )
             except Exception as exc:
                 logger.debug("前向日志写入失败 %s: %s", code, exc)
 

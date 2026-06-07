@@ -3,11 +3,11 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-from .cache import CachedQuoteContext
+from .cache import CachedQuoteContext, SQLiteQuoteContext
 from .market import load_market
 
 
@@ -147,13 +147,15 @@ def main(argv: list[str] | None = None) -> int:
 
     args = _parse_args(argv)
     market = load_market(args.market)
+    if args.benchmark_code:
+        market = replace(
+            market,
+            config=replace(market.config, backtest_benchmark=args.benchmark_code),
+            default_benchmark=args.benchmark_code,
+        )
     codes = tuple(_parse_codes(args.codes))
     output_dir = Path(args.output_dir)
-    quote_ctx = CachedQuoteContext(
-        args.cache_dir,
-        quote_ctx_factory=lambda: _open_quote_context(market.config),
-        refresh=args.refresh_cache,
-    )
+    quote_ctx = _make_quote_context(args, market.config)
     try:
         engine = market.backtest.BacktestEngine(quote_ctx, market.config)
         result = engine.run(list(codes), args.start, args.end)
@@ -216,12 +218,29 @@ def _open_quote_context(config: Any) -> Any:
     return ft.OpenQuoteContext(host=config.host, port=config.port)
 
 
+def _make_quote_context(args: argparse.Namespace, config: Any) -> Any:
+    if args.source == "sqlite":
+        return SQLiteQuoteContext(args.sqlite_db)
+    return CachedQuoteContext(
+        args.cache_dir,
+        quote_ctx_factory=lambda: _open_quote_context(config),
+        refresh=args.refresh_cache,
+    )
+
+
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--market", required=True, choices=("us", "hk"))
     parser.add_argument("--codes", required=True)
     parser.add_argument("--start", required=True)
     parser.add_argument("--end", required=True)
+    parser.add_argument("--source", choices=("opend", "sqlite"), default="opend")
+    parser.add_argument("--sqlite-db", default="us_strategy/history_data.db")
+    parser.add_argument(
+        "--benchmark-code",
+        default="",
+        help="Optional benchmark override, e.g. HK.02800 when HK.800000 is unavailable.",
+    )
     parser.add_argument("--cache-dir", default="data/research_cache")
     parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--refresh-cache", action="store_true")

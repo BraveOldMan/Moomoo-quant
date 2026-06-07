@@ -1,9 +1,10 @@
-"""OpenD-backed Parquet cache for research runs."""
+"""Quote-context adapters for research runs."""
 
 from __future__ import annotations
 
 from collections.abc import Callable
 from pathlib import Path
+import sqlite3
 from typing import Any
 
 import pandas as pd
@@ -123,3 +124,176 @@ class CachedQuoteContext:
                 raise RuntimeError("cache miss requires an OpenD quote context")
             self._quote_ctx = self._factory()
         return self._quote_ctx
+
+
+class SQLiteQuoteContext:
+    """Read-only quote-context adapter backed by the local history SQLite DB."""
+
+    def __init__(self, db_path: str | Path) -> None:
+        self._db_path = Path(db_path)
+
+    def close(self) -> None:
+        """Match OpenD quote context lifecycle; no persistent handle is held."""
+
+    def request_history_kline(
+        self,
+        code: str,
+        start: str,
+        end: str,
+        ktype: Any = None,
+        max_count: int = 1000,
+    ) -> tuple[int, pd.DataFrame, Any]:
+        """Return daily K-line rows from `history_kline` in moomoo tuple shape."""
+
+        _ = (ktype, max_count)
+        query = """
+            SELECT substr(time_key, 1, 10) AS time_key,
+                   open,
+                   close,
+                   high,
+                   low,
+                   turnover,
+                   turnover_rate,
+                   volume,
+                   _code AS code
+              FROM history_kline
+             WHERE _code = ?
+               AND substr(time_key, 1, 10) >= ?
+               AND substr(time_key, 1, 10) <= ?
+             ORDER BY time_key
+        """
+        frame = self._read_frame(
+            query,
+            (code, start[:10], end[:10]),
+            numeric_columns=(
+                "open",
+                "close",
+                "high",
+                "low",
+                "turnover",
+                "turnover_rate",
+                "volume",
+            ),
+        )
+        return _ret_ok(), frame, None
+
+    def get_capital_flow(
+        self,
+        code: str,
+        period_type: Any = None,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> tuple[int, pd.DataFrame]:
+        """Return daily capital-flow rows from `capital_flow_day`."""
+
+        _ = period_type
+        query = """
+            SELECT substr(capital_flow_item_time, 1, 10) AS time_key,
+                   main_in_flow
+              FROM capital_flow_day
+             WHERE _code = ?
+               AND substr(capital_flow_item_time, 1, 10) >= ?
+               AND substr(capital_flow_item_time, 1, 10) <= ?
+             ORDER BY capital_flow_item_time
+        """
+        frame = self._read_frame(
+            query,
+            (code, (start or "")[:10], (end or "9999-12-31")[:10]),
+            numeric_columns=("main_in_flow",),
+        )
+        return _ret_ok(), frame
+
+    def get_daily_short_volume(
+        self,
+        code: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> tuple[int, pd.DataFrame]:
+        """Return daily short-volume rows from `daily_short_volume`."""
+
+        query = """
+            SELECT timestamp_str AS time_key,
+                   short_percent,
+                   daily_trade_avg_ratio,
+                   total_shares_short,
+                   volume
+              FROM daily_short_volume
+             WHERE _code = ?
+               AND timestamp_str >= ?
+               AND timestamp_str <= ?
+             ORDER BY timestamp_str
+        """
+        frame = self._read_frame(
+            query,
+            (code, (start or "")[:10], (end or "9999-12-31")[:10]),
+            numeric_columns=(
+                "short_percent",
+                "daily_trade_avg_ratio",
+                "total_shares_short",
+                "volume",
+            ),
+        )
+        return _ret_ok(), frame
+
+    def get_microstructure_daily_features(
+        self,
+        code: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> tuple[int, pd.DataFrame]:
+        """Return daily derived microstructure rows for forward research."""
+
+        query = """
+            SELECT trade_date AS time_key,
+                   trade_date,
+                   l2_score_avg,
+                   l2_score_max,
+                   l2_imbalance_avg,
+                   l2_danger_count,
+                   dark_pool_event_count,
+                   dark_pool_net_ratio,
+                   dark_pool_score_max,
+                   broker_snapshot_count,
+                   broker_score_avg,
+                   broker_score_max
+              FROM microstructure_daily_features
+             WHERE _code = ?
+               AND trade_date >= ?
+               AND trade_date <= ?
+             ORDER BY trade_date
+        """
+        frame = self._read_frame(
+            query,
+            (code, (start or "")[:10], (end or "9999-12-31")[:10]),
+            numeric_columns=(
+                "l2_score_avg",
+                "l2_score_max",
+                "l2_imbalance_avg",
+                "l2_danger_count",
+                "dark_pool_event_count",
+                "dark_pool_net_ratio",
+                "dark_pool_score_max",
+                "broker_snapshot_count",
+                "broker_score_avg",
+                "broker_score_max",
+            ),
+        )
+        return _ret_ok(), frame
+
+    def _read_frame(
+        self,
+        query: str,
+        params: tuple[Any, ...],
+        numeric_columns: tuple[str, ...] = (),
+    ) -> pd.DataFrame:
+        if not self._db_path.exists():
+            return pd.DataFrame()
+        try:
+            with sqlite3.connect(self._db_path) as conn:
+                frame = pd.read_sql_query(query, conn, params=params)
+        except (sqlite3.Error, pd.errors.DatabaseError):
+            return pd.DataFrame()
+        for column in numeric_columns:
+            if column in frame:
+                frame.loc[:, column] = pd.to_numeric(frame[column], errors="coerce")
+        return frame
