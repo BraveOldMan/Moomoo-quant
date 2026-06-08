@@ -2,7 +2,7 @@
 import logging
 import math
 from dataclasses import dataclass, field
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import moomoo as ft
 
@@ -15,7 +15,7 @@ from order_book_l2 import (
 )
 
 from . import features
-from .clock import market_date
+from .clock import market_date, market_datetime
 from .config import StrategyConfig
 from .data_access import DataAccess
 
@@ -226,9 +226,7 @@ class SignalCalculator:
                 scores["option_iv"] = opt[0]
                 extra["option_iv"] = opt[1]
                 if opt[0] >= cfg.option_warning_score:
-                    risk_warnings.append(
-                        f"期权skew/PCR风险偏高: score={opt[0]:.1f}"
-                    )
+                    risk_warnings.append(f"期权skew/PCR风险偏高: score={opt[0]:.1f}")
 
         if cfg.use_macro_filter:
             macro = self._macro_filter_score()
@@ -425,12 +423,32 @@ class SignalCalculator:
             return None
         # 数据新鲜度门控：仅在最新一笔属于今日时有效（盘后会返回上一交易日尾盘）
         try:
-            last_time = str(df["time"].iloc[-1])[:10]
+            last_raw = str(df["time"].iloc[-1])
+            last_time = last_raw[:10]
             if last_time != market_date(self._cfg.market_timezone).isoformat():
                 logger.debug("逐笔数据非当日(%s)，order_flow 跳过 %s", last_time, code)
                 return None
         except (KeyError, IndexError):
             return None
+        # 盘中时效门：阈值>0 时，最后一笔早于 now−阈值（秒）则判过期跳过。
+        max_stale = self._cfg.order_flow_max_staleness_seconds
+        if max_stale > 0:
+            try:
+                last_dt = datetime.strptime(last_raw[:19], "%Y-%m-%d %H:%M:%S")
+                now_local = market_datetime(self._cfg.market_timezone).replace(
+                    tzinfo=None
+                )
+                age = (now_local - last_dt).total_seconds()
+                if age > max_stale:
+                    logger.debug(
+                        "逐笔数据过期 %.0fs>%.0fs，order_flow 跳过 %s",
+                        age,
+                        max_stale,
+                        code,
+                    )
+                    return None
+            except ValueError:
+                pass
         buy_vol = 0.0
         sell_vol = 0.0
         for _, r in df.iterrows():
@@ -514,7 +532,11 @@ class SignalCalculator:
             raw[key] = {"bid_depth": bid_depth, "ask_depth": ask_depth}
         if not scores:
             return None
-        scores["obi"] = sum(scores.values()) / len(scores)
+        # 距离衰减加权：档位越深（level 越大）权重越低（1/level），
+        # 降低 level-1 盘口跳动噪声对综合 OBI 的影响。
+        decay = {k: 1.0 / int(k.split("_l")[1]) for k in scores}
+        total_w = sum(decay.values())
+        scores["obi"] = sum(scores[k] * decay[k] for k in decay) / total_w
         return {"scores": scores, "raw": raw}
 
     def _order_book_pressure_score(self, code: str) -> tuple[float, dict] | None:
@@ -874,9 +896,7 @@ class SignalCalculator:
             return False
         cfg = self._cfg
         lockup_expiry = listing + timedelta(days=cfg.lockup_days)
-        days_to_expiry = (
-            lockup_expiry - market_date(self._cfg.market_timezone)
-        ).days
+        days_to_expiry = (lockup_expiry - market_date(self._cfg.market_timezone)).days
         return 0 <= days_to_expiry <= cfg.lockup_warning_days
 
 

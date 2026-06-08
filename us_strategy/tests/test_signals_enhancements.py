@@ -106,5 +106,7 @@ def test_us_signals_log_multi_obi_and_option_warning_without_weight() -> None:
     assert cfg.active_weights()["dark_pool_proxy"] == 0.0
     assert result.scores["option_iv"] >= cfg.option_warning_score
     assert result.risk_warnings
-    assert "option_iv" not in cfg.active_weights()
+    # option_iv 与其它因子一致：use 标志开启即以默认 0 权重进入 active_weights，
+    # 校准后赋予 w_option_iv 即可参与综合评分（修复前被静默丢弃）。
+    assert cfg.active_weights()["option_iv"] == 0.0
     assert result.buy_block_reasons == ["纳指/VIX宏观过滤数据缺失"]

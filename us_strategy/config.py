@@ -213,6 +213,15 @@ class StrategyConfig:
     buy_threshold: float = 35.0
     sell_threshold: float = 60.0
 
+    # ── 回测无风险利率（仅影响 Sharpe/Sortino）。美股取短期美债≈4%，
+    #    可用 ANNUAL_RISK_FREE_RATE 覆盖；设 0 则回到「无风险利率=0」口径。──
+    annual_risk_free_rate: float = 0.04
+    # ── order_flow 盘中时效门（秒，0＝禁用：仅按日期判新鲜度，保持现状）──
+    order_flow_max_staleness_seconds: float = 0.0
+    # ── IPO origin 生命周期：持有超过 N 个交易日后老仓降级为常规退出规则 ──
+    #    0＝禁用（一旦以 IPO 建仓则终身沿用 IPO 止盈止损，保持现状）。
+    ipo_origin_max_hold_days: int = 0
+
     # ── 止损 ────────────────────────────────────────────────────────────
     stop_loss_pct: float = 0.05  # 固定止损 5%
     use_trailing_stop: bool = True  # 启用浮动止损
@@ -313,6 +322,15 @@ class StrategyConfig:
                 os.environ.get("IPO_TRAILING_STOP_PCT", "0.08")
             ),
             min_hold_days=int(os.environ.get("MIN_HOLD_DAYS", "1")),
+            ipo_origin_max_hold_days=int(
+                os.environ.get("IPO_ORIGIN_MAX_HOLD_DAYS", "0")
+            ),
+            annual_risk_free_rate=float(
+                os.environ.get("ANNUAL_RISK_FREE_RATE", "0.04")
+            ),
+            order_flow_max_staleness_seconds=float(
+                os.environ.get("ORDER_FLOW_MAX_STALENESS_SECONDS", "0.0")
+            ),
             daily_loss_limit_pct=float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.02")),
             circuit_breaker_baseline=os.environ.get(
                 "CIRCUIT_BREAKER_BASELINE", "prev_close"
@@ -465,4 +483,6 @@ class StrategyConfig:
             weights["intraday_flow"] = self.w_intraday_flow
         if self.use_short_metrics:
             weights["short"] = self.w_short
+        if self.use_option_iv:
+            weights["option_iv"] = self.w_option_iv
         return weights

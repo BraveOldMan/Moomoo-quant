@@ -27,6 +27,68 @@ def test_load_us_watchlist_filters_comments_and_non_us(tmp_path: Path) -> None:
     assert daily.load_us_watchlist(watchlist) == ("US.AAPL", "US.MSFT")
 
 
+def test_load_positions_missing_db_does_not_create_file(tmp_path: Path) -> None:
+    db_path = tmp_path / "missing_positions.db"
+
+    assert daily.load_positions(str(db_path)) == {}
+    assert not db_path.exists()
+
+
+def test_load_positions_reads_existing_db_with_read_only_uri(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "positions.db"
+    db_path.write_text("", encoding="utf-8")
+    calls: list[tuple[str, bool]] = []
+
+    class FakeCursor:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+        def fetchall(self):
+            return self._rows
+
+    class FakeConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback) -> None:
+            return None
+
+        def execute(self, sql: str):
+            if "sqlite_master" in sql:
+                return FakeCursor([(1,)])
+            if "PRAGMA table_info" in sql:
+                return FakeCursor(
+                    [
+                        (0, "code"),
+                        (1, "cost_price"),
+                        (2, "buy_date"),
+                        (3, "tranches_bought"),
+                        (4, "peak_price"),
+                    ],
+                )
+            return FakeCursor([("US.AAPL", 100.0, "2026-06-05", 1, 110.0, 0, "regular")])
+
+    def fake_connect(database_uri: str, uri: bool = False) -> FakeConnection:
+        calls.append((database_uri, uri))
+        return FakeConnection()
+
+    monkeypatch.setattr(daily.sqlite3, "connect", fake_connect)
+
+    positions = daily.load_positions(str(db_path))
+
+    assert calls
+    assert calls[0][1] is True
+    assert "mode=ro" in calls[0][0]
+    assert "immutable=1" in calls[0][0]
+    assert positions["US.AAPL"].cost_price == 100.0
+
+
 def test_select_expiries_and_atm_pair() -> None:
     expiries = pd.DataFrame(
         [

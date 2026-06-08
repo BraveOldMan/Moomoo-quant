@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time as time_module
@@ -24,7 +25,7 @@ from us_strategy import features
 from us_strategy.config import Signal, StrategyConfig
 from us_strategy.data_access import DataAccess
 from us_strategy.market_calendar import is_trading_day
-from us_strategy.persistence import PositionRecord, PositionStore
+from us_strategy.persistence import PositionRecord
 from us_strategy.signals import SignalCalculator, SignalResult
 from us_strategy.strategy import IPOStrategy
 
@@ -221,7 +222,9 @@ def validate_target_date(
 def build_paths(target_date: date, output_dir: Path | None) -> ReportPaths:
     """Build all deterministic output paths for one report date."""
 
-    out = output_dir if output_dir is not None else DEFAULT_OUTPUT_ROOT / ymd(target_date)
+    out = (
+        output_dir if output_dir is not None else DEFAULT_OUTPUT_ROOT / ymd(target_date)
+    )
     return ReportPaths(
         output_dir=out,
         summary_md=out / "summary.md",
@@ -314,7 +317,9 @@ def fetch_daily_bar(
     )
 
 
-def fetch_index_bars(data: DataAccess, target_date: date) -> tuple[list[dict[str, Any]], list[str]]:
+def fetch_index_bars(
+    data: DataAccess, target_date: date
+) -> tuple[list[dict[str, Any]], list[str]]:
     """Fetch index daily bars with ETF fallback proxies."""
 
     rows: list[dict[str, Any]] = []
@@ -377,9 +382,40 @@ def position_snapshot(
 def load_positions(db_path: str) -> dict[str, PositionRecord]:
     """Load local persisted positions without creating a missing database."""
 
-    if not Path(db_path).exists():
+    path = Path(db_path)
+    if not path.exists():
         return {}
-    return PositionStore(db_path).load_all()
+    uri = f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+    with sqlite3.connect(uri, uri=True) as conn:
+        table_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'positions'",
+        ).fetchone()
+        if table_exists is None:
+            return {}
+        cols = {
+            row[1] for row in conn.execute("PRAGMA table_info(positions)").fetchall()
+        }
+        optional_cols = [
+            "qty" if "qty" in cols else "0 AS qty",
+            "origin" if "origin" in cols else "'regular' AS origin",
+        ]
+        rows = conn.execute(
+            "SELECT code, cost_price, buy_date, tranches_bought, peak_price, "
+            + ", ".join(optional_cols)
+            + " FROM positions",
+        ).fetchall()
+    return {
+        row[0]: PositionRecord(
+            code=row[0],
+            cost_price=row[1],
+            buy_date=date.fromisoformat(row[2]),
+            tranches_bought=row[3],
+            peak_price=row[4],
+            qty=row[5],
+            origin=row[6] or "regular",
+        )
+        for row in rows
+    }
 
 
 @contextmanager
@@ -457,7 +493,9 @@ def analyze_stocks(
                     "liquidity_ok": False,
                     "risk_warnings": [],
                     "buy_block_reasons": [],
-                    "position": position_snapshot(positions.get(code), close_price).__dict__,
+                    "position": position_snapshot(
+                        positions.get(code), close_price
+                    ).__dict__,
                     "factor_note": "daily bar missing",
                 },
             )
@@ -483,7 +521,9 @@ def analyze_stocks(
                 "liquidity_ok": result.liquidity_ok if result else False,
                 "risk_warnings": list(result.risk_warnings) if result else [],
                 "buy_block_reasons": list(result.buy_block_reasons) if result else [],
-                "position": position_snapshot(positions.get(code), close_price).__dict__,
+                "position": position_snapshot(
+                    positions.get(code), close_price
+                ).__dict__,
                 "factor_note": factor_note(diag_result or main_result),
             },
         )
@@ -584,7 +624,9 @@ def analyze_options(
         ret, exp = option_quote_call(lambda c=code: ctx.get_option_expiration_date(c))
         if ret != ft.RET_OK or not isinstance(exp, pd.DataFrame) or exp.empty:
             if ret != ft.RET_OK:
-                errors.append(f"{code} option_expiration unavailable: {describe_api_error(ret, exp)}")
+                errors.append(
+                    f"{code} option_expiration unavailable: {describe_api_error(ret, exp)}"
+                )
             rows.append(option_gap_row(code, target_date, "no_option_expiration"))
             continue
         expiries = select_expiries(exp, 2)
@@ -596,13 +638,19 @@ def analyze_options(
         for expiry in expiries:
             chain = chains.get(expiry)
             if chain is None or chain.empty:
-                rows.append(option_gap_row(code, target_date, f"chain_missing:{expiry}"))
+                rows.append(
+                    option_gap_row(code, target_date, f"chain_missing:{expiry}")
+                )
                 continue
             pair = select_atm_pair(chain, latest_close)
             if pair is None:
-                rows.append(option_gap_row(code, target_date, f"atm_pair_missing:{expiry}"))
+                rows.append(
+                    option_gap_row(code, target_date, f"atm_pair_missing:{expiry}")
+                )
                 continue
-            rows.append(option_pair_row(ctx, code, expiry, pair, latest_close, target_date))
+            rows.append(
+                option_pair_row(ctx, code, expiry, pair, latest_close, target_date)
+            )
     return rows, errors
 
 
@@ -662,9 +710,13 @@ def fetch_option_chains(
     if ret == ft.RET_OK and isinstance(frame, pd.DataFrame) and not frame.empty:
         chains.update(split_option_chain_by_expiry(frame, expiries))
     else:
-        errors.append(f"{expiries[0]}..{expiries[-1]} unavailable: {describe_api_error(ret, frame)}")
+        errors.append(
+            f"{expiries[0]}..{expiries[-1]} unavailable: {describe_api_error(ret, frame)}"
+        )
 
-    missing = [expiry for expiry in expiries if expiry not in chains or chains[expiry].empty]
+    missing = [
+        expiry for expiry in expiries if expiry not in chains or chains[expiry].empty
+    ]
     for expiry in missing:
         ret, frame = option_quote_call(
             lambda c=code, ex=expiry: ctx.get_option_chain(c, start=ex, end=ex),
@@ -683,10 +735,7 @@ def split_option_chain_by_expiry(
 ) -> dict[str, pd.DataFrame]:
     """Split a moomoo option chain range response into exact expiry frames."""
 
-    return {
-        expiry: filter_option_chain_by_expiry(chain, expiry)
-        for expiry in expiries
-    }
+    return {expiry: filter_option_chain_by_expiry(chain, expiry) for expiry in expiries}
 
 
 def filter_option_chain_by_expiry(chain: pd.DataFrame, expiry: str) -> pd.DataFrame:
@@ -807,7 +856,9 @@ def option_snapshot(ctx: QuoteContext, option_code: str) -> dict[str, Any]:
     return option_snapshots(ctx, [option_code]).get(option_code, {})
 
 
-def option_snapshots(ctx: QuoteContext, option_codes: list[str]) -> dict[str, dict[str, Any]]:
+def option_snapshots(
+    ctx: QuoteContext, option_codes: list[str]
+) -> dict[str, dict[str, Any]]:
     """Fetch option market snapshots in one paced request keyed by option code."""
 
     ret, frame = option_quote_call(lambda: ctx.get_market_snapshot(option_codes))
@@ -904,7 +955,9 @@ def write_outputs(
         index=False,
         encoding="utf-8-sig",
     )
-    pd.DataFrame(option_rows).to_csv(paths.option_csv, index=False, encoding="utf-8-sig")
+    pd.DataFrame(option_rows).to_csv(
+        paths.option_csv, index=False, encoding="utf-8-sig"
+    )
     paths.summary_md.write_text(render_markdown(payload), encoding="utf-8")
 
 
@@ -1098,7 +1151,10 @@ def quick_takeaways(
         + (", ".join(row["code"] for row in sell[:8]) if sell else "无"),
         "- 期权高风险提示: "
         + (
-            ", ".join(f"{row['underlying']}({row['risk_score']:.1f})" for row in high_option[:8])
+            ", ".join(
+                f"{row['underlying']}({row['risk_score']:.1f})"
+                for row in high_option[:8]
+            )
             if high_option
             else "无明显高风险 ATM skew/PCR"
         ),
@@ -1292,15 +1348,25 @@ def send_to_lark(
         )
         for path, command in dry_receipts.items():
             path.write_text(
-                json.dumps({"dry_run": True, "command": command}, ensure_ascii=False, indent=2),
+                json.dumps(
+                    {"dry_run": True, "command": command}, ensure_ascii=False, indent=2
+                ),
                 encoding="utf-8",
             )
         paths.lark_fetch_json.write_text(
-            json.dumps({"dry_run": True, "skipped": "no file token"}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"dry_run": True, "skipped": "no file token"},
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         paths.lark_message_json.write_text(
-            json.dumps({"dry_run": True, "skipped": "no message id"}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {"dry_run": True, "skipped": "no message id"},
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         return LarkResult(None, None, None, skipped=False)
@@ -1415,6 +1481,9 @@ def build_lark_summary_card(
 
     takeaways = extract_takeaways(summary_path)
     summary_content = "\n".join(takeaways[:4]) or "- 暂无摘要"
+    doc_link_text = "完整个股深度、全因子策略信号和期权限深分析请打开云文档查看。"
+    if doc_url:
+        doc_link_text += f"\n\n[打开完整云文档]({doc_url})"
     elements: list[dict[str, Any]] = [
         {
             "tag": "div",
@@ -1428,7 +1497,7 @@ def build_lark_summary_card(
             "tag": "div",
             "text": {
                 "tag": "lark_md",
-                "content": "完整个股深度、全因子策略信号和期权限深分析请打开云文档查看。",
+                "content": doc_link_text,
             },
         },
     ]
@@ -1610,7 +1679,9 @@ def run_report(
             with anchor_strategy_date(target_date):
                 indexes, index_errors = fetch_index_bars(data, target_date)
                 stocks, stock_errors = analyze_stocks(data, config, codes, target_date)
-                options, option_errors = analyze_options(quote_ctx, codes, stocks, target_date)
+                options, option_errors = analyze_options(
+                    quote_ctx, codes, stocks, target_date
+                )
             warnings = index_errors + stock_errors + option_errors
             payload = build_payload(
                 target_date=target_date,
@@ -1647,7 +1718,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments for the US daily report."""
 
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--date", default="", help="Explicit US trade date, YYYY-MM-DD.")
+    parser.add_argument(
+        "--date", default="", help="Explicit US trade date, YYYY-MM-DD."
+    )
     parser.add_argument("--watchlist", default=str(DEFAULT_WATCHLIST))
     parser.add_argument("--output-dir", default="")
     parser.add_argument("--host", default="127.0.0.1")
@@ -1656,7 +1729,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--send", dest="send", action="store_true")
     parser.add_argument("--no-send", dest="send", action="store_false")
     parser.add_argument("--dry-run-lark", action="store_true")
-    parser.add_argument("--force", action="store_true", help="Bypass after-close readiness check.")
+    parser.add_argument(
+        "--force", action="store_true", help="Bypass after-close readiness check."
+    )
     parser.add_argument(
         "--force-send",
         action="store_true",

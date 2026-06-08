@@ -71,9 +71,7 @@ class IPOStrategy:
 
             # 固定止损（最高优先级）
             if current_price is not None and has_position and avg_cost > 0:
-                stop_loss_pct = (
-                    cfg.ipo_stop_loss_pct if is_ipo else cfg.stop_loss_pct
-                )
+                stop_loss_pct = cfg.ipo_stop_loss_pct if is_ipo else cfg.stop_loss_pct
                 if (avg_cost - current_price) / avg_cost >= stop_loss_pct:
                     loss_pct = (avg_cost - current_price) / avg_cost * 100
                     return self._sell_or_hold(
@@ -100,8 +98,10 @@ class IPOStrategy:
                     )
 
             # 浮动止损
-            if current_price is not None and has_position and (
-                cfg.use_trailing_stop or is_ipo
+            if (
+                current_price is not None
+                and has_position
+                and (cfg.use_trailing_stop or is_ipo)
             ):
                 peak = self._peak_prices.get(code, avg_cost)
                 trailing_pct = (
@@ -325,7 +325,19 @@ class IPOStrategy:
         return basis[1] / basis[0]
 
     def _is_ipo_code_locked(self, code: str) -> bool:
-        return self._position_origins.get(code) == "ipo" or code in self._ipo_codes
+        if code in self._ipo_codes:
+            return True
+        if self._position_origins.get(code) != "ipo":
+            return False
+        # 历史以 IPO 建仓：持有超过生命周期阈值后降级为常规退出规则。
+        max_days = self._cfg.ipo_origin_max_hold_days
+        if max_days > 0:
+            buy_date = self._buy_dates.get(code)
+            if buy_date is not None:
+                today = market_date(self._cfg.market_timezone)
+                if _trading_days_between(buy_date, today) > max_days:
+                    return False
+        return True
 
     def _entry_tranches_for_locked(self, code: str) -> int:
         if self._is_ipo_code_locked(code):

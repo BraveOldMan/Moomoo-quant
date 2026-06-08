@@ -208,9 +208,7 @@ class Trader:
             sizing_base = net_value if net_value > 0 else power
             ratio = cfg.position_ratio if position_ratio is None else position_ratio
             tranches = cfg.entry_tranches if entry_tranches is None else entry_tranches
-            tranche_budget = (
-                sizing_base * ratio / max(1, tranches)
-            )
+            tranche_budget = sizing_base * ratio / max(1, tranches)
             qty = int(math.floor(tranche_budget / price)) if price > 0 else 0
             if price > 0:
                 qty = min(qty, int(power / price))
@@ -295,14 +293,19 @@ class Trader:
             )
             if latest_filled > filled or _is_filled_status(latest_status):
                 fill_price = latest_price
-                filled = latest_filled or qty
+                # 优先采用重查到的真实成交量；查不到（为 0）才回退请求量。
+                filled = latest_filled if latest_filled > 0 else qty
                 status = f"{latest_status};{cancel_status}"
             elif _cancel_failure_implies_fill(cancel_status):
                 fill_price = latest_price
-                filled = qty
+                # 撤单失败暗示已成交：若重查到真实部分成交量则采用之，
+                # 避免无条件按 qty 全额计账造成超量持仓。
+                filled = latest_filled if latest_filled > 0 else qty
                 status = f"FILLED_ASSUMED_AFTER_CANCEL_FAILED;{cancel_status}"
         if filled <= 0:
-            self._last_failure_reason = f"订单未成交或超时: status={status}, order_id={order_id}"
+            self._last_failure_reason = (
+                f"订单未成交或超时: status={status}, order_id={order_id}"
+            )
         return (filled > 0), fill_price, filled
 
     def _cancel_order(self, order_id: object) -> str:
@@ -415,7 +418,9 @@ def _cancel_failure_implies_fill(cancel_status: object) -> bool:
     """moomoo 撤单失败文案明确表示已成交时，按成交竞态处理。"""
     text = str(cancel_status)
     upper = text.upper()
-    return any(marker in text or marker in upper for marker in _CANCEL_FAILURE_FILLED_MARKERS)
+    return any(
+        marker in text or marker in upper for marker in _CANCEL_FAILURE_FILLED_MARKERS
+    )
 
 
 def _positive_float(value: object) -> float:

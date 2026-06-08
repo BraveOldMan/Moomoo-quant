@@ -1,6 +1,6 @@
 # Moomoo Quant
 
-> Current version: `v1.8.0` (2026-06-09)
+> Current version: `v1.9.0` (2026-06-09)
 
 Moomoo Quant is a dual-market quantitative trading and research framework built on top of the
 moomoo OpenD gateway, formerly known as the Futu OpenAPI gateway. It covers both US equities and
@@ -578,6 +578,18 @@ Before changing strategy logic, validate at least:
 - No PowerShell JSON or report-generation logic added outside Python.
 
 ## Release Highlights
+
+### v1.9.0
+
+- Deep audit of the main strategy, signals, and backtest logic; most agent-flagged "critical" issues were verified against source as false positives (textbook Sortino downside deviation, Wilder ATR, intentional PCR fallback, filter-style macro/crypto gates, no look-ahead in the daily-close fill model) and deliberately left unchanged.
+- Fixed `option_iv` being computed but silently dropped: `active_weights()` now registers it when `use_option_iv` is on, consistent with sibling factors (US and HK).
+- Fixed walk-forward segments sharing one boundary trading day; adjacent splits no longer overlap (US and HK).
+- Order-book imbalance now aggregates levels with `1/level` distance decay instead of an equal mean, reducing level-1 quote noise.
+- Added an opt-in intraday staleness gate for the order-flow factor (`ORDER_FLOW_MAX_STALENESS_SECONDS`, default `0` = disabled).
+- Added an opt-in IPO-origin lifecycle downgrade (`IPO_ORIGIN_MAX_HOLD_DAYS`, default `0` = disabled): aged IPO positions revert to regular exit rules.
+- Hardened partial-fill accounting in the limit-order executor: prefer the re-queried real filled quantity over assuming the full request size after a failed cancel.
+- Sharpe/Sortino now support a configurable annual risk-free rate (`ANNUAL_RISK_FREE_RATE`), enabled by default at ≈4% (US) and ≈3.5% (HK); set `0` to restore the prior zero-rate reporting.
+- Added focused unit tests for every change; full suite green (US + HK).
 
 ### v1.8.0
 

@@ -52,6 +52,14 @@ class BacktestResult:
     trades: list[TradeRecord] = field(default_factory=list)
     equity_curve: list[float] = field(default_factory=list)
     benchmark_curve: list[float] = field(default_factory=list)
+    risk_free_rate: float = 0.0  # 年化无风险利率，用于 Sharpe/Sortino（0＝历史口径）
+
+    @property
+    def _daily_risk_free(self) -> float:
+        """把年化无风险利率折算为单日（252 交易日复利）。"""
+        if self.risk_free_rate <= 0:
+            return 0.0
+        return (1.0 + self.risk_free_rate) ** (1.0 / _TRADING_DAYS_PER_YEAR) - 1.0
 
     @property
     def total_return_pct(self) -> float:
@@ -102,11 +110,12 @@ class BacktestResult:
         if len(rets) < 2:
             return 0.0
         mean = sum(rets) / len(rets)
+        excess = mean - self._daily_risk_free
         var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
         std = math.sqrt(var)
         if std <= 0:
             return 0.0
-        return mean / std * math.sqrt(_TRADING_DAYS_PER_YEAR)
+        return excess / std * math.sqrt(_TRADING_DAYS_PER_YEAR)
 
     @property
     def sortino(self) -> float:
@@ -114,14 +123,17 @@ class BacktestResult:
         if len(rets) < 2:
             return 0.0
         mean = sum(rets) / len(rets)
-        downside = [r for r in rets if r < 0]
+        daily_rf = self._daily_risk_free
+        excess = mean - daily_rf
+        downside = [r - daily_rf for r in rets if r < daily_rf]
         if not downside:
             return 0.0
-        dvar = sum(r**2 for r in downside) / len(rets)
+        # 下行偏差：分母用总样本数（非下行样本贡献 0），即标准 Target Downside Deviation
+        dvar = sum(d**2 for d in downside) / len(rets)
         dstd = math.sqrt(dvar)
         if dstd <= 0:
             return 0.0
-        return mean / dstd * math.sqrt(_TRADING_DAYS_PER_YEAR)
+        return excess / dstd * math.sqrt(_TRADING_DAYS_PER_YEAR)
 
     @property
     def max_drawdown_pct(self) -> float:
@@ -296,9 +308,7 @@ class BacktestEngine:
                     atr = features.compute_atr(
                         h["high"], h["low"], h["close"], cfg.atr_period
                     )
-                    buy_blocks = self._buy_block_reasons(
-                        code, dt_key, filter_data
-                    )
+                    buy_blocks = self._buy_block_reasons(code, dt_key, filter_data)
                     cash, _ = self._apply_decision(
                         dt_key,
                         code,
@@ -344,7 +354,12 @@ class BacktestEngine:
                     )
 
         return BacktestResult(
-            self._initial_cash, cash, trades, equity_curve, benchmark_curve
+            self._initial_cash,
+            cash,
+            trades,
+            equity_curve,
+            benchmark_curve,
+            risk_free_rate=self._cfg.annual_risk_free_rate,
         )
 
     def _score(self, code, h, bench_closes, weights) -> float:
@@ -422,7 +437,9 @@ class BacktestEngine:
             peak = pos.get("peak", pos["avg"])
             if close > peak:
                 pos["peak"] = peak = close
-            trailing_pct = cfg.ipo_trailing_stop_pct if is_ipo else cfg.trailing_stop_pct
+            trailing_pct = (
+                cfg.ipo_trailing_stop_pct if is_ipo else cfg.trailing_stop_pct
+            )
             if can_exit and peak > 0 and (peak - close) / peak >= trailing_pct:
                 return self._exit(dt, code, close, cash, positions, trades), True
 
@@ -447,7 +464,9 @@ class BacktestEngine:
                 )
                 qty = sized.qty
             else:
-                position_ratio = cfg.ipo_position_ratio if is_ipo else cfg.position_ratio
+                position_ratio = (
+                    cfg.ipo_position_ratio if is_ipo else cfg.position_ratio
+                )
                 budget = cash * position_ratio / entry_tranches
                 qty = int(budget / close) if close > 0 else 0
             cost, comm = self._gross_cost(qty, close)
@@ -624,7 +643,13 @@ class BacktestEngine:
         bounds = [date_strs[i] for i in idx]
         results = []
         for i in range(n_splits):
-            seg_start = bounds[i]
+            # i>0 时从上一段边界的次日开始，避免相邻段共享同一边界交易日（样本重叠）。
+            if i == 0:
+                seg_start = bounds[i]
+            else:
+                seg_start = (pd.Timestamp(bounds[i]) + pd.Timedelta(days=1)).strftime(
+                    "%Y-%m-%d"
+                )
             seg_end = bounds[i + 1]
             logger.info("walk-forward 第 %d 段: %s → %s", i + 1, seg_start, seg_end)
             results.append(self.run(codes, seg_start, seg_end))
