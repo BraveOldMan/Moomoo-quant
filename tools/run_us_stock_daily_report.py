@@ -432,6 +432,7 @@ def analyze_stocks(
             buy_date=record.buy_date,
             tranches_bought=record.tranches_bought,
             peak_price=record.peak_price,
+            origin=record.origin,
         )
 
     rows: list[dict[str, Any]] = []

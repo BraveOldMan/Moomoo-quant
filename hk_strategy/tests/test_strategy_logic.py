@@ -163,3 +163,35 @@ def test_option_warning_does_not_block_buy_signal():
 
     assert decision.signal is Signal.BUY
     assert "风险提示" in decision.reason
+
+
+def test_ipo_position_uses_ipo_take_profit():
+    result = _signal_result(code="HK.X", composite_score=20.0)
+    s = _strategy_with_result(result, min_hold_days=0, ipo_take_profit_pct=0.12)
+    s.record_buy("HK.X", 10.0, 100, origin="ipo")
+
+    decision = s.evaluate("HK.X", current_price=11.3)
+
+    assert decision.signal is Signal.SELL
+    assert "IPO触发固定止盈" in decision.reason
+
+
+def test_regular_position_does_not_use_ipo_take_profit():
+    result = _signal_result(code="HK.X", composite_score=20.0)
+    s = _strategy_with_result(result, min_hold_days=0, ipo_take_profit_pct=0.12)
+    s.record_buy("HK.X", 10.0, 100, origin="regular")
+
+    decision = s.evaluate("HK.X", current_price=11.3)
+
+    assert decision.signal is not Signal.SELL
+
+
+def test_today_ipo_uses_ipo_entry_tranches_for_buy_signal():
+    result = _signal_result(code="HK.X", composite_score=20.0)
+    s = _strategy_with_result(result, entry_tranches=1, ipo_entry_tranches=2)
+    s.set_ipo_codes({"HK.X"})
+
+    decision = s.evaluate("HK.X", current_price=10.0)
+
+    assert decision.signal is Signal.BUY
+    assert "IPO第1/2批" in decision.reason

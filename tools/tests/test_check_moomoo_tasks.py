@@ -105,6 +105,31 @@ def test_validate_task_records_accepts_us_sim_trade_task(tmp_path: Path) -> None
     assert sim_trade.messages == ()
 
 
+def test_validate_task_records_accepts_running_task_result(tmp_path: Path) -> None:
+    script = tmp_path / "us_strategy" / "run_simulate.ps1"
+    script.parent.mkdir()
+    script.write_text("", encoding="utf-8")
+    records = [
+        {
+            "TaskName": "MoomooUSSimTrade",
+            "Exists": True,
+            "Arguments": (
+                '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden '
+                f'-File "{script}"'
+            ),
+            "TriggerType": "MSFT_TaskWeeklyTrigger",
+            "StartBoundary": "2026-06-08T21:15:00+08:00",
+            "LastTaskResult": 267009,
+        }
+    ]
+
+    checks = validate_task_records(records, tmp_path)
+    sim_trade = next(check for check in checks if check.task_name == "MoomooUSSimTrade")
+
+    assert sim_trade.status == "ok"
+    assert sim_trade.messages == ()
+
+
 def test_validate_task_records_accepts_hk_sim_trade_task(tmp_path: Path) -> None:
     script = tmp_path / "hk_strategy" / "run_simulate_task.ps1"
     script.parent.mkdir()

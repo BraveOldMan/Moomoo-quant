@@ -89,3 +89,41 @@ def test_fetch_recent_ipos_parses_list_time_column():
 
     # 只保留近 10 天内"已上市"的 US.NEW；排除过期 US.OLD 与未上市 US.FUTURE
     assert result == {"US.NEW": today}
+
+
+def test_fetch_today_ipos_only_includes_same_day_listings():
+    import pandas as pd
+
+    from datetime import timedelta
+
+    from hk_strategy.main import _fetch_today_ipos
+
+    today = date.today()
+    df = pd.DataFrame(
+        {
+            "code": ["HK.06658", "HK.00001", "HK.09999"],
+            "name": ["Today Co", "Old Co", "Future Co"],
+            "list_time": [
+                today.isoformat(),
+                (today - timedelta(days=1)).isoformat(),
+                (today + timedelta(days=1)).isoformat(),
+            ],
+            "ipo_price_min": [43.58, 20.0, 30.0],
+            "ipo_price_max": [43.58, 22.0, 32.0],
+            "issue_size": [11_464_100, 2_000_000, 3_000_000],
+        }
+    )
+
+    class _FakeQuote:
+        def get_ipo_list(self, market):
+            return 0, df
+
+    class _FakeData:
+        _quote = _FakeQuote()
+
+    result, errors = _fetch_today_ipos(_FakeData(), markets=("HK",), today=today)
+
+    assert errors == []
+    assert list(result) == ["HK.06658"]
+    assert result["HK.06658"].name == "Today Co"
+    assert result["HK.06658"].issue_size == "11464100"

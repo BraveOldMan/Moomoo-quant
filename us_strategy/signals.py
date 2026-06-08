@@ -109,7 +109,7 @@ class SignalCalculator:
         liquidity_ok = turnover_usd >= cfg.min_daily_turnover_usd
 
         scores: dict[str, float] = {}
-        extra: dict = {}
+        extra: dict = {"turnover_usd": turnover_usd}
         risk_warnings: list[str] = []
         buy_block_reasons: list[str] = []
 

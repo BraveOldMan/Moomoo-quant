@@ -17,6 +17,7 @@ class PositionRecord:
     tranches_bought: int
     peak_price: float
     qty: float = 0.0
+    origin: str = "regular"
 
 
 class PositionStore:
@@ -43,14 +44,20 @@ class PositionStore:
                     buy_date        TEXT NOT NULL,
                     tranches_bought INTEGER NOT NULL DEFAULT 1,
                     peak_price      REAL NOT NULL,
-                    qty             REAL NOT NULL DEFAULT 0
+                    qty             REAL NOT NULL DEFAULT 0,
+                    origin          TEXT NOT NULL DEFAULT 'regular'
                 )
             """)
-            # 旧库迁移：补 qty 列
+            # 旧库迁移：补 qty/origin 列
             cols = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
             if "qty" not in cols:
                 conn.execute(
                     "ALTER TABLE positions ADD COLUMN qty REAL NOT NULL DEFAULT 0"
+                )
+            if "origin" not in cols:
+                conn.execute(
+                    "ALTER TABLE positions "
+                    "ADD COLUMN origin TEXT NOT NULL DEFAULT 'regular'"
                 )
 
     def save(self, record: PositionRecord) -> None:
@@ -58,14 +65,15 @@ class PositionStore:
             conn.execute(
                 """
                 INSERT INTO positions
-                    (code, cost_price, buy_date, tranches_bought, peak_price, qty)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (code, cost_price, buy_date, tranches_bought, peak_price, qty, origin)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(code) DO UPDATE SET
                     cost_price      = excluded.cost_price,
                     buy_date        = excluded.buy_date,
                     tranches_bought = excluded.tranches_bought,
                     peak_price      = excluded.peak_price,
-                    qty             = excluded.qty
+                    qty             = excluded.qty,
+                    origin          = excluded.origin
             """,
                 (
                     record.code,
@@ -74,6 +82,7 @@ class PositionStore:
                     record.tranches_bought,
                     record.peak_price,
                     record.qty,
+                    _normalize_origin(record.origin),
                 ),
             )
 
@@ -84,7 +93,7 @@ class PositionStore:
     def load_all(self) -> dict[str, PositionRecord]:
         with self._conn() as conn:
             rows = conn.execute(
-                "SELECT code, cost_price, buy_date, tranches_bought, peak_price, qty"
+                "SELECT code, cost_price, buy_date, tranches_bought, peak_price, qty, origin"
                 " FROM positions"
             ).fetchall()
         return {
@@ -95,6 +104,7 @@ class PositionStore:
                 tranches_bought=row[3],
                 peak_price=row[4],
                 qty=row[5],
+                origin=_normalize_origin(row[6]),
             )
             for row in rows
         }
@@ -243,3 +253,8 @@ class SignalLogStore:
             )
             for r in rows
         ]
+
+
+def _normalize_origin(value: str | None) -> str:
+    origin = str(value or "regular").strip().lower()
+    return "ipo" if origin == "ipo" else "regular"

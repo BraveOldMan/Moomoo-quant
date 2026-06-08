@@ -85,12 +85,15 @@ class Trader:
         lot_size: int,
         atr: float | None = None,
         is_new_position: bool = True,
+        position_ratio: float | None = None,
+        entry_tranches: int | None = None,
     ) -> tuple[bool, float, int]:
         """买入一批。返回 (是否成功, 成交均价, 成交数量)。
 
         - 新开仓受 max_positions 限制；max_positions <= 0 表示不限制。
         - 加仓不受 max_positions 限制。
         - use_atr_sizing 时按 ATR 风险预算定量，否则按净值比例/批数定量。
+        - position_ratio/entry_tranches 仅用于 IPO 等独立仓位 profile。
         """
         self._last_failure_reason = ""
         if (
@@ -114,7 +117,15 @@ class Trader:
         power = _buying_power_from_account(row, self._cfg.trd_env)
         net_value = self.get_portfolio_value()
 
-        qty = self._size_position(current_price, lot_size, atr, power, net_value)
+        qty = self._size_position(
+            current_price,
+            lot_size,
+            atr,
+            power,
+            net_value,
+            position_ratio=position_ratio,
+            entry_tranches=entry_tranches,
+        )
         if qty <= 0:
             self._last_failure_reason = _zero_quantity_reason(
                 current_price,
@@ -123,6 +134,8 @@ class Trader:
                 power,
                 net_value,
                 self._cfg,
+                position_ratio=position_ratio,
+                entry_tranches=entry_tranches,
             )
             logger.warning(
                 "%s，跳过买入 %s (price=%.3f)",
@@ -168,6 +181,8 @@ class Trader:
         atr: float | None,
         power: float,
         net_value: float,
+        position_ratio: float | None = None,
+        entry_tranches: int | None = None,
     ) -> int:
         cfg = self._cfg
         lot = max(1, int(lot_size or 1))
@@ -191,8 +206,10 @@ class Trader:
                 qty = min(qty, int(power / price))
         else:
             sizing_base = net_value if net_value > 0 else power
+            ratio = cfg.position_ratio if position_ratio is None else position_ratio
+            tranches = cfg.entry_tranches if entry_tranches is None else entry_tranches
             tranche_budget = (
-                sizing_base * cfg.position_ratio / max(1, cfg.entry_tranches)
+                sizing_base * ratio / max(1, tranches)
             )
             qty = int(math.floor(tranche_budget / price)) if price > 0 else 0
             if price > 0:
@@ -417,6 +434,8 @@ def _zero_quantity_reason(
     power: float,
     net_value: float,
     cfg: StrategyConfig,
+    position_ratio: float | None = None,
+    entry_tranches: int | None = None,
 ) -> str:
     """解释仓位计算为 0 的原因，特别标出港股整手约束。"""
     if price <= 0:
@@ -442,7 +461,9 @@ def _zero_quantity_reason(
             f"ATR={atr or 0:.3f}，最低一手约={min_lot_cash:.2f}，lot_size={lot}"
         )
     sizing_base = net_value if net_value > 0 else power
-    tranche_budget = sizing_base * cfg.position_ratio / max(1, cfg.entry_tranches)
+    ratio = cfg.position_ratio if position_ratio is None else position_ratio
+    tranches = cfg.entry_tranches if entry_tranches is None else entry_tranches
+    tranche_budget = sizing_base * ratio / max(1, tranches)
     if tranche_budget < min_lot_cash:
         return (
             f"单批预算不足：单批预算={tranche_budget:.2f}，"

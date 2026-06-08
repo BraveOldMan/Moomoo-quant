@@ -14,6 +14,10 @@
   ALLOW_REAL_TRADING               实盘二次确认开关，REAL 模式须设为 yes 否则拒绝启动
   TRADE_PASSWORD                   实盘解锁密码（REAL 必填）
   IPO_DAYS_WINDOW                  关注上市后 N 天内新股，默认 10
+  IPO_WATCHLIST_FILE               今日 IPO 独立观察文件
+  IPO_POSITION_RATIO / IPO_ENTRY_TRANCHES           IPO 独立仓位参数
+  IPO_TAKE_PROFIT_PCT / IPO_STOP_LOSS_PCT / IPO_TRAILING_STOP_PCT
+                                   IPO 独立止盈止损参数
   POSITION_RATIO / MAX_POSITIONS / ENTRY_TRANCHES   仓位参数
   USE_ATR_SIZING / ATR_RISK_PER_TRADE_PCT           ATR 仓位
   STOP_LOSS_PCT / TRAILING_STOP_PCT                 止损
@@ -22,7 +26,7 @@
   USE_LIMIT_ORDERS / LIMIT_PRICE_TOLERANCE_PCT      限价执行
   TRADE_FAILURE_ALERT_COOLDOWN_S                    买卖失败提醒冷却秒数
   USE_RS / USE_ORB / USE_VWAP_SIGNAL / USE_BROKER_SIGNAL   因子开关
-  ALERT_EMAIL / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID   告警
+  ALERT_EMAIL / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID / FEISHU_CHAT_ID   告警
 """
 
 import logging
@@ -35,6 +39,16 @@ from datetime import date, datetime, time as _time, timedelta
 import moomoo as ft
 
 from dark_pool_proxy import DarkPoolProxyConfig, DarkPoolProxyTracker
+from ipo_runtime import (
+    IpoCandidate,
+    build_ipo_analysis_message,
+    build_ipo_found_message,
+    build_ipo_unavailable_message,
+    candidate_from_record,
+    fetch_today_ipos,
+    snapshot_ready,
+)
+from ipo_watchlist import append_today_records, load_today_records
 from order_book_l2 import L2ImbalanceConfig, L2ImbalanceTracker, OrderBookCache
 
 from .alerts import AlertManager
@@ -118,6 +132,20 @@ class _FailureAlertGate:
         return True
 
 
+class _OnceEventGate:
+    """Process-local once gate for IPO discovery and analysis alerts."""
+
+    def __init__(self) -> None:
+        self._sent: set[tuple[str, str]] = set()
+
+    def should_send(self, event: str, code: str) -> bool:
+        key = (event, code)
+        if key in self._sent:
+            return False
+        self._sent.add(key)
+        return True
+
+
 def _should_ignore_unheld_sell(
     has_strategy_position: bool,
     broker_qty: int,
@@ -181,6 +209,16 @@ def _fetch_recent_ipos(
                 continue
     logger.info("发现近 %d 天内新股 %d 只: %s", days, len(result), list(result.keys()))
     return result
+
+
+def _fetch_today_ipos(
+    data: DataAccess,
+    markets: tuple,
+    today: date,
+) -> tuple[dict[str, IpoCandidate], list[str]]:
+    """获取上市日等于 today 的 IPO 候选，排除未来待上市和旧 IPO。"""
+
+    return fetch_today_ipos(data, markets, today)
 
 
 def _snapshot_display_name(row: object, code: str) -> str:
@@ -394,6 +432,13 @@ def _get_snapshot(data: DataAccess, code: str) -> tuple[float | None, int]:
     return price, lot_size
 
 
+def _get_snapshot_row(data: DataAccess, code: str) -> object | None:
+    ret, df = data.get_market_snapshot(code)
+    if ret != ft.RET_OK or df.empty:
+        return None
+    return df.iloc[0]
+
+
 def _open_trade_context(cfg: StrategyConfig) -> ft.OpenSecTradeContext:
     """创建绑定美股证券账户的交易上下文，避免 NONE 选中港股模拟账户。"""
     return ft.OpenSecTradeContext(
@@ -460,6 +505,7 @@ def _sync_broker_positions(
         price = _first_positive_value(row, ("price", "last_price"))
         existing = saved.get(code)
         buy_date = existing.buy_date if existing else today
+        origin = existing.origin if existing else "regular"
         inferred_tranches = _infer_tranches_from_qty(qty, cfg)
         tranches = max(existing.tranches_bought if existing else 1, inferred_tranches)
         tranches = min(tranches, max(1, cfg.entry_tranches))
@@ -471,6 +517,7 @@ def _sync_broker_positions(
             tranches_bought=tranches,
             peak_price=peak_price,
             qty=qty,
+            origin=origin,
         )
         strategy.restore_position(
             code=record.code,
@@ -479,6 +526,7 @@ def _sync_broker_positions(
             buy_date=record.buy_date,
             tranches_bought=record.tranches_bought,
             peak_price=record.peak_price,
+            origin=record.origin,
         )
         store.save(record)
         saved[code] = record
@@ -562,6 +610,7 @@ def run() -> None:
                 buy_date=rec.buy_date,
                 tranches_bought=rec.tranches_bought,
                 peak_price=rec.peak_price,
+                origin=rec.origin,
             )
 
     _sync_broker_positions(data, strategy, store, cfg, saved)
@@ -569,6 +618,20 @@ def run() -> None:
     events: queue.Queue = queue.Queue()
     baseline_set_date: dict[str, date] = {}
     failure_alert_gate = _FailureAlertGate(cfg.trade_failure_alert_cooldown_s)
+    ipo_alert_gate = _OnceEventGate()
+    ipo_candidates: dict[str, IpoCandidate] = {
+        code: candidate_from_record(record)
+        for code, record in load_today_records(
+            cfg.ipo_watchlist_file,
+            market_date(cfg.market_timezone),
+        ).items()
+    }
+    if ipo_candidates:
+        calculator.set_listing_dates(
+            {code: candidate.trade_date for code, candidate in ipo_candidates.items()}
+        )
+        strategy.set_ipo_codes(set(ipo_candidates))
+        logger.info("从 IPO 观察名单加载今日 IPO: %s", list(ipo_candidates))
 
     def send_failure_alert(
         event: str,
@@ -590,6 +653,18 @@ def run() -> None:
         if not _is_market_open(cfg):
             return
 
+        candidate = ipo_candidates.get(code)
+        is_ipo_trade = candidate is not None or strategy.get_origin(code) == "ipo"
+        if candidate is not None:
+            row = _get_snapshot_row(data, code)
+            if row is None or not snapshot_ready(row):
+                if ipo_alert_gate.should_send("ipo_unavailable", code):
+                    alerts.send(
+                        "IPO观察",
+                        build_ipo_unavailable_message(candidate, row, cfg),
+                    )
+                return
+
         # 每个交易日开盘后首次：注入熔断基准净值
         today = market_date(cfg.market_timezone)
         if baseline_set_date.get("d") != today:
@@ -601,6 +676,16 @@ def run() -> None:
         decision = strategy.evaluate(code, current_price=price)
         logger.info("决策: %s", decision)
 
+        if (
+            candidate is not None
+            and decision.result is not None
+            and ipo_alert_gate.should_send("ipo_analysis", code)
+        ):
+            alerts.send(
+                "IPO首次分析",
+                build_ipo_analysis_message(candidate, decision, cfg),
+            )
+
         if decision.signal == Signal.BUY:
             if _is_in_open_cooldown(cfg):
                 logger.info("开盘冷静期内，跳过买入 %s", code)
@@ -609,10 +694,18 @@ def run() -> None:
             _, lot_size = _get_snapshot(data, code)
             is_new = not strategy.has_position(code)
             ok, fill_price, filled = trader.buy(
-                code, price, lot_size, atr=decision.atr, is_new_position=is_new
+                code,
+                price,
+                lot_size,
+                atr=decision.atr,
+                is_new_position=is_new,
+                position_ratio=cfg.ipo_position_ratio if is_ipo_trade else None,
+                entry_tranches=cfg.ipo_entry_tranches if is_ipo_trade else None,
             )
             if ok:
-                strategy.record_buy(code, fill_price, filled)
+                origin = "ipo" if is_ipo_trade else "regular"
+                strategy.record_buy(code, fill_price, filled, origin=origin)
+                entry_tranches = cfg.ipo_entry_tranches if is_ipo_trade else cfg.entry_tranches
                 store.save(
                     PositionRecord(
                         code=code,
@@ -621,6 +714,7 @@ def run() -> None:
                         tranches_bought=strategy.get_tranches_bought(code),
                         peak_price=strategy.get_peak_price(code),
                         qty=strategy.get_qty(code),
+                        origin=origin,
                     )
                 )
                 account_snapshot = _account_snapshot_text(data)
@@ -637,7 +731,7 @@ def run() -> None:
                             f"成交数量：qty={filled}\n"
                             f"成交均价：{fill_price:.3f}\n"
                             f"批次：第{strategy.get_tranches_bought(code)}/"
-                            f"{cfg.entry_tranches}批"
+                            f"{entry_tranches}批"
                         ),
                         account_snapshot=account_snapshot,
                     ),
@@ -748,6 +842,9 @@ def run() -> None:
     if cfg.watchlist:
         monitor.subscribe(list(cfg.watchlist))
         logger.info("自选 universe %d 只: %s", len(cfg.watchlist), list(cfg.watchlist))
+    if ipo_candidates:
+        monitor.subscribe(list(ipo_candidates.keys()))
+        logger.info("今日 IPO universe %d 只: %s", len(ipo_candidates), list(ipo_candidates))
 
     try:
         while True:
@@ -759,19 +856,40 @@ def run() -> None:
                         f"当日亏损超过 {cfg.daily_loss_limit_pct * 100:.0f}%，暂停买入直到次日",
                     )
 
-            ipo_map = _fetch_recent_ipos(
+            scan_date = market_date(cfg.market_timezone)
+            fetched_ipos, ipo_errors = _fetch_today_ipos(
                 data,
                 cfg.markets,
-                cfg.ipo_days_window,
-                today=market_date(cfg.market_timezone),
+                today=scan_date,
             )
-            if ipo_map:
-                calculator.set_listing_dates(ipo_map)
-                monitor.subscribe(list(ipo_map.keys()))
+            for error in ipo_errors:
+                logger.warning(error)
+                if ipo_alert_gate.should_send("ipo_scan_failed", error):
+                    alerts.send("IPO扫描失败", error)
+            if fetched_ipos:
+                ipo_candidates.update(fetched_ipos)
+                added = append_today_records(
+                    cfg.ipo_watchlist_file,
+                    {code: candidate.record for code, candidate in fetched_ipos.items()},
+                )
+                for record in added:
+                    candidate = fetched_ipos[record.code]
+                    if ipo_alert_gate.should_send("ipo_found", record.code):
+                        alerts.send("发现今日IPO", build_ipo_found_message(candidate, cfg))
+                calculator.set_listing_dates(
+                    {
+                        code: candidate.trade_date
+                        for code, candidate in ipo_candidates.items()
+                    }
+                )
+                strategy.set_ipo_codes(set(ipo_candidates))
+                monitor.subscribe(list(ipo_candidates.keys()))
 
             # universe = IPO 扫描 ∪ 自选清单 ∪ 现有持仓
             all_codes = (
-                set(ipo_map.keys()) | set(cfg.watchlist) | strategy.get_active_codes()
+                set(ipo_candidates.keys())
+                | set(cfg.watchlist)
+                | strategy.get_active_codes()
             )
             for code in all_codes:
                 price, _ = _get_snapshot(data, code)

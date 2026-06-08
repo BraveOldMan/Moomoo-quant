@@ -1,6 +1,6 @@
 # Moomoo-quant · 美股/港股多因子量化交易系统
 
-> 当前版本：v1.7.0（2026-06-09）
+> 当前版本：v1.8.0（2026-06-09）
 
 基于 **moomoo OpenD 网关**（原 Futu API）的美股（US）与港股（HK）程序化交易系统：从行情采集、多因子评分、决策（PDT/港股午休/熔断/加权成本）、限价执行、持仓恢复，到回测、因子 IC 校准、前向样本采集与每日自动体检，形成完整闭环：
 
@@ -22,7 +22,7 @@
 - [因子校准闭环](#因子校准闭环)
 - [配置（环境变量）](#配置环境变量)
 - [moomoo API 限频](#moomoo-api-限频)
-- [v1.7.0 变更摘要](#v170-变更摘要)
+- [v1.8.0 变更摘要](#v180-变更摘要)
 - [数据持久化](#数据持久化)
 - [测试](#测试)
 - [关键约定](#关键约定)
@@ -193,10 +193,12 @@ ic_report.py        每日收盘后：每个交易日算一个横截面前向 IC
 |---|---|
 | 连接 | `OPEND_HOST` / `OPEND_PORT` |
 | 交易环境 | `TRADE_ENV`(SIMULATE/REAL) / `ALLOW_REAL_TRADING` / `TRADE_PASSWORD` |
-| universe | `WATCHLIST` / `WATCHLIST_FILE` / `IPO_DAYS_WINDOW` |
+| universe | `WATCHLIST` / `WATCHLIST_FILE` / `IPO_DAYS_WINDOW` / `IPO_WATCHLIST_FILE` |
 | 港股流动性 | `MIN_DAILY_TURNOVER` |
 | 仓位 | `POSITION_RATIO` / `MAX_POSITIONS` / `ENTRY_TRANCHES` / `USE_ATR_SIZING` |
+| IPO 仓位 | `IPO_POSITION_RATIO` / `IPO_ENTRY_TRANCHES` |
 | 风控 | `STOP_LOSS_PCT` / `TRAILING_STOP_PCT` / `MIN_HOLD_DAYS`(PDT) / `DAILY_LOSS_LIMIT_PCT` / `CIRCUIT_BREAKER_BASELINE` |
+| IPO 风控 | `IPO_TAKE_PROFIT_PCT` / `IPO_STOP_LOSS_PCT` / `IPO_TRAILING_STOP_PCT` |
 | 执行 | `USE_LIMIT_ORDERS` / `LIMIT_PRICE_TOLERANCE_PCT` |
 | 因子开关 | `USE_RS` / `USE_ORB` / `USE_VWAP_SIGNAL` / `USE_ORDER_FLOW` / `USE_DARK_POOL_PROXY` / `USE_ORDER_BOOK_IMBALANCE` / `USE_L2_IMBALANCE_TRACKER` / `USE_INTRADAY_FLOW` / `USE_SHORT_METRICS` / `USE_OPTION_IV` / `USE_BROKER_SIGNAL` / `USE_BROKER_GATE` / `USE_HK_STATUS_SIGNAL` |
 | 告警 | `ALERT_EMAIL` / `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` / `FEISHU_CHAT_ID` / `LARK_CLI` |
@@ -220,6 +222,20 @@ ic_report.py        每日收盘后：每个交易日算一个横截面前向 IC
 | `get_stock_quote` / `get_order_book` / `get_rt_ticker` / `get_rt_data` / `get_cur_kline` / `get_broker_queue` | 读取订阅后的 OpenD 推送缓存 | 不按服务器请求限频计算，但受订阅额度和数据权限约束 |
 
 没有在当前官方页面发布单接口频率的低频查询，统一在 `moomoo_rate_limits.py` 标记为 `official=False`，仓库默认按 30 次/30 秒保守处理，不允许把未知接口默认提到高频。
+
+## v1.8.0 变更摘要
+
+本版本新增 US/HK 今日 IPO 独立模拟交易流程：当天 IPO 不再混入普通 `watchlist.txt`，而是独立观察、独立仓位、独立止盈止损，并保留关键事件飞书卡片提醒。实盘仍保持 `TRADE_ENV=REAL` + `ALLOW_REAL_TRADING=yes` + `TRADE_PASSWORD` 三重门禁，不自动启动实盘。
+
+| 方向 | 变更 |
+|---|---|
+| 今日 IPO | US/HK 启动后按各自市场日扫描 `get_ipo_list`，仅将 `list_time == market_date` 的当日上市标的写入独立 `ipo_watchlist.txt` 并纳入模拟交易；旧记录只留痕，不进入当日交易 |
+| IPO 风控 | IPO 持仓持久化为 `origin=ipo`，重启后继续使用独立 `5% / 2批 / 止盈12% / 止损6% / 回撤8%` profile；普通自选股仍使用原 `POSITION_RATIO` 和止损/回撤参数 |
+| 主循环 | 启动/盘中定时扫描今日 IPO，写独立观察文件，订阅行情；真实价格和成交额未就绪时只发一次观察阻断，不下单 |
+| 飞书提醒 | IPO 仅发送发现、首次可分析、买卖/风控和扫描失败/关键阻断事件；继续走 `interactive` 卡片链路，避免轮询 HOLD 刷屏 |
+| 回测与验证 | 策略、交易、回测统一支持 IPO sizing profile 和 `origin` 恢复；普通 watchlist 小窗口回测报告已分别输出到 `report/outputs/backtest_report_ipo_change_us` 与 `report/outputs/backtest_report_ipo_change_hk` |
+| 自动化核验 | `tools.check_moomoo_tasks` 接受 Windows Task Scheduler `267009` 正在运行状态，避免把常驻任务误判为失败 |
+| 验证 | `python -m pytest -q` 401 项通过；`python -m ruff check .` 通过；`git diff --check` 通过；计划任务 strict 仅剩既有 `MoomooHKTickCollect last_task_result=2` 历史状态异常 |
 
 ## v1.7.0 变更摘要
 
@@ -309,7 +325,8 @@ python -m research.run_backtest_report --market us --codes US.AAPL,US.MSFT --sta
 - **稳健默认**：新因子默认关闭、权重 0，须 IC 校准后启用；限价执行默认开启
 - **仓位限制**：`MAX_POSITIONS<=0` 表示不限制同时持仓；美股模拟启动器当前设置 `MAX_POSITIONS=8`，港股模拟启动器当前设置 `MAX_POSITIONS=13`
 - **模拟仓位参数**：美股模拟账户按 `POSITION_RATIO=0.06`、`ENTRY_TRANCHES=2`、`ORDER_LOTS_PER_TRADE=0` 分批建仓，单批约为净值 3%；港股模拟账户因已接近满仓，启动器设置 `POSITION_RATIO=0`、`ORDER_LOTS_PER_TRADE=0`，暂停新增买入，只保留已有仓位卖出/风控处理
-- **盘中提醒**：美股/港股模拟启动器已配置 `FEISHU_CHAT_ID`，买卖/失败/熔断提醒通过 `lark-cli` 发送飞书群卡片
+- **IPO 观察池**：`us_strategy/ipo_watchlist.txt` 与 `hk_strategy/ipo_watchlist.txt` 使用 `YYYY-MM-DD<TAB>CODE<TAB>NAME<TAB>LIST_TIME`，启动时只加载当日记录；当日 IPO 使用独立 `IPO_POSITION_RATIO=0.05`、`IPO_ENTRY_TRANCHES=2`、`IPO_TAKE_PROFIT_PCT=0.12`、`IPO_STOP_LOSS_PCT=0.06`、`IPO_TRAILING_STOP_PCT=0.08`
+- **盘中提醒**：美股/港股模拟启动器已配置 `FEISHU_CHAT_ID`，买卖/失败/熔断提醒通过 `lark-cli` 发送飞书群卡片；IPO 只发送发现、首次可分析、买卖/风控和关键阻断事件，避免轮询 HOLD 刷屏
 - **实盘解锁**：实盘交易前必须 `trade_ctx.unlock_trade(password)`，且 `ALLOW_REAL_TRADING=yes`
 - **数据可得性**：`get_capital_distribution`、`get_broker_queue` 在不同市场可用性不同，上线前按目标市场先跑 `probe`
 

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """HKEX 假日表与 SQLite 持久化单测。"""
 
+import sqlite3
 from datetime import date
 
 from hk_strategy.market_calendar import get_hkex_holidays, is_trading_day
@@ -57,6 +58,7 @@ def test_position_store_roundtrip(tmp_path):
         tranches_bought=2,
         peak_price=50.0,
         qty=120,
+        origin="ipo",
     )
     store.save(rec)
     loaded = store.load_all()
@@ -66,6 +68,7 @@ def test_position_store_roundtrip(tmp_path):
     assert got.qty == 120
     assert got.tranches_bought == 2
     assert got.buy_date == date(2024, 3, 21)
+    assert got.origin == "ipo"
 
 
 def test_position_store_upsert(tmp_path):
@@ -76,6 +79,7 @@ def test_position_store_upsert(tmp_path):
     loaded = store.load_all()
     assert loaded["HK.X"].cost_price == 12
     assert loaded["HK.X"].qty == 200
+    assert loaded["HK.X"].origin == "regular"
 
 
 def test_position_store_delete(tmp_path):
@@ -84,6 +88,31 @@ def test_position_store_delete(tmp_path):
     store.save(PositionRecord("HK.X", 10, date(2024, 1, 2), 1, 10, 100))
     store.delete("HK.X")
     assert store.load_all() == {}
+
+
+def test_position_store_migrates_missing_origin_as_regular(tmp_path):
+    db = tmp_path / "old_pos.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE positions (
+                code            TEXT PRIMARY KEY,
+                cost_price      REAL NOT NULL,
+                buy_date        TEXT NOT NULL,
+                tranches_bought INTEGER NOT NULL DEFAULT 1,
+                peak_price      REAL NOT NULL,
+                qty             REAL NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO positions VALUES (?, ?, ?, ?, ?, ?)",
+            ("HK.OLD", 10.0, "2026-06-08", 1, 11.0, 100.0),
+        )
+
+    loaded = PositionStore(str(db)).load_all()
+
+    assert loaded["HK.OLD"].origin == "regular"
 
 
 def test_portfolio_value_store_loads_latest_before_date(tmp_path):

@@ -6,6 +6,10 @@ from enum import Enum
 from moomoo_rate_limits import DEFAULT_DATA_ACCESS_RATE_LIMIT, DEFAULT_RATE_WINDOW_S
 
 _DEFAULT_WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.txt")
+_DEFAULT_IPO_WATCHLIST_FILE = os.path.join(
+    os.path.dirname(__file__),
+    "ipo_watchlist.txt",
+)
 
 
 def _csv_tuple(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -67,6 +71,7 @@ class StrategyConfig:
     # ── IPO 扫描 ────────────────────────────────────────────────────────
     ipo_days_window: int = 10  # 只关注上市后 N 天内的新股
     markets: tuple = ("US",)  # 本仓库专注美股
+    ipo_watchlist_file: str = _DEFAULT_IPO_WATCHLIST_FILE
 
     # ── 通用 universe（除 IPO 扫描外，额外纳入的自选美股）──────────────
     # 空=仅 IPO 扫描（与历史行为一致）；填入即对任意美股做同一套因子分析。
@@ -86,6 +91,8 @@ class StrategyConfig:
     entry_tranches: int = 2  # 分批买入笔数（1=一次性全仓）
     order_lots_per_trade: int = 0  # >0 时每次买入固定 N 手，覆盖仓位比例
     exit_tranches: int = 1  # 分批卖出笔数（1=一次性清仓）
+    ipo_position_ratio: float = 0.05
+    ipo_entry_tranches: int = 2
 
     # ── 波动率/ATR 仓位（替代固定 position_ratio）──────────────────────
     use_atr_sizing: bool = False  # True 时按 ATR 风险预算定仓位
@@ -210,6 +217,9 @@ class StrategyConfig:
     stop_loss_pct: float = 0.05  # 固定止损 5%
     use_trailing_stop: bool = True  # 启用浮动止损
     trailing_stop_pct: float = 0.08  # 从最高点回撤 8% 触发
+    ipo_take_profit_pct: float = 0.12
+    ipo_stop_loss_pct: float = 0.06
+    ipo_trailing_stop_pct: float = 0.08
 
     # ── PDT 保护（按交易日计算，非自然日）──────────────────────────────
     min_hold_days: int = 1  # 买入后至少持仓 N 个交易日（0=关闭）
@@ -274,6 +284,10 @@ class StrategyConfig:
             allow_real_trading=os.environ.get("ALLOW_REAL_TRADING", "").lower()
             in ("yes", "true", "1"),
             ipo_days_window=int(os.environ.get("IPO_DAYS_WINDOW", "10")),
+            ipo_watchlist_file=os.environ.get(
+                "IPO_WATCHLIST_FILE",
+                _DEFAULT_IPO_WATCHLIST_FILE,
+            ),
             watchlist=_load_watchlist(),
             general_turnover_warning=float(
                 os.environ.get("GENERAL_TURNOVER_WARNING", "5.0")
@@ -285,12 +299,19 @@ class StrategyConfig:
             max_positions=int(os.environ.get("MAX_POSITIONS", "3")),
             entry_tranches=int(os.environ.get("ENTRY_TRANCHES", "2")),
             order_lots_per_trade=int(os.environ.get("ORDER_LOTS_PER_TRADE", "0")),
+            ipo_position_ratio=float(os.environ.get("IPO_POSITION_RATIO", "0.05")),
+            ipo_entry_tranches=int(os.environ.get("IPO_ENTRY_TRANCHES", "2")),
             use_atr_sizing=_bool("USE_ATR_SIZING", False),
             atr_risk_per_trade_pct=float(
                 os.environ.get("ATR_RISK_PER_TRADE_PCT", "0.01")
             ),
             stop_loss_pct=float(os.environ.get("STOP_LOSS_PCT", "0.05")),
             trailing_stop_pct=float(os.environ.get("TRAILING_STOP_PCT", "0.08")),
+            ipo_take_profit_pct=float(os.environ.get("IPO_TAKE_PROFIT_PCT", "0.12")),
+            ipo_stop_loss_pct=float(os.environ.get("IPO_STOP_LOSS_PCT", "0.06")),
+            ipo_trailing_stop_pct=float(
+                os.environ.get("IPO_TRAILING_STOP_PCT", "0.08")
+            ),
             min_hold_days=int(os.environ.get("MIN_HOLD_DAYS", "1")),
             daily_loss_limit_pct=float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "0.02")),
             circuit_breaker_baseline=os.environ.get(

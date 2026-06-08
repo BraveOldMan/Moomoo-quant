@@ -19,6 +19,7 @@ class Decision:
     score: float
     reason: str
     atr: float | None = None  # 供 trader 做 ATR 仓位
+    result: SignalResult | None = None
 
     def __str__(self) -> str:
         return (
@@ -38,6 +39,8 @@ class IPOStrategy:
         self._buy_dates: dict[str, date] = {}
         self._peak_prices: dict[str, float] = {}
         self._tranches_bought: dict[str, int] = {}
+        self._position_origins: dict[str, str] = {}
+        self._ipo_codes: set[str] = set()
         # 熔断状态
         self._circuit_breaker_active = False
         self._circuit_breaker_date: date | None = None
@@ -57,6 +60,8 @@ class IPOStrategy:
         with self._lock:
             avg_cost = self._avg_cost(code)
             has_position = avg_cost is not None
+            is_ipo = self._is_ipo_code_locked(code)
+            entry_tranches = self._entry_tranches_for_locked(code)
 
             # 更新浮动止损峰值
             if current_price is not None and has_position:
@@ -66,7 +71,10 @@ class IPOStrategy:
 
             # 固定止损（最高优先级）
             if current_price is not None and has_position and avg_cost > 0:
-                if (avg_cost - current_price) / avg_cost >= cfg.stop_loss_pct:
+                stop_loss_pct = (
+                    cfg.ipo_stop_loss_pct if is_ipo else cfg.stop_loss_pct
+                )
+                if (avg_cost - current_price) / avg_cost >= stop_loss_pct:
                     loss_pct = (avg_cost - current_price) / avg_cost * 100
                     return self._sell_or_hold(
                         code,
@@ -74,12 +82,32 @@ class IPOStrategy:
                         result.atr,
                         f"触发止损: 成本{avg_cost:.3f} 现价{current_price:.3f} 亏损{loss_pct:.1f}%",
                         f"止损触发但 PDT 保护生效，亏损 {loss_pct:.1f}%",
+                        result,
+                    )
+
+            # IPO 固定止盈
+            if current_price is not None and has_position and avg_cost > 0 and is_ipo:
+                profit = (current_price - avg_cost) / avg_cost
+                if profit >= cfg.ipo_take_profit_pct:
+                    profit_pct = profit * 100
+                    return self._sell_or_hold(
+                        code,
+                        score,
+                        result.atr,
+                        f"IPO触发固定止盈: 成本{avg_cost:.3f} 现价{current_price:.3f} 盈利{profit_pct:.1f}%",
+                        f"IPO止盈触发但 PDT 保护生效，盈利 {profit_pct:.1f}%",
+                        result,
                     )
 
             # 浮动止损
-            if current_price is not None and has_position and cfg.use_trailing_stop:
+            if current_price is not None and has_position and (
+                cfg.use_trailing_stop or is_ipo
+            ):
                 peak = self._peak_prices.get(code, avg_cost)
-                if peak > 0 and (peak - current_price) / peak >= cfg.trailing_stop_pct:
+                trailing_pct = (
+                    cfg.ipo_trailing_stop_pct if is_ipo else cfg.trailing_stop_pct
+                )
+                if peak > 0 and (peak - current_price) / peak >= trailing_pct:
                     dd = (peak - current_price) / peak * 100
                     return self._sell_or_hold(
                         code,
@@ -87,6 +115,7 @@ class IPOStrategy:
                         result.atr,
                         f"触发浮动止损: 最高{peak:.3f} 现价{current_price:.3f} 回撤{dd:.1f}%",
                         f"浮动止损触发但 PDT 保护生效，回撤 {dd:.1f}%",
+                        result,
                     )
 
             # 出货信号（综合分高或锁定期临近）
@@ -97,13 +126,14 @@ class IPOStrategy:
                     result.atr,
                     self._sell_reason(result),
                     f"出货信号触发但 PDT 保护生效（需持仓至少 {cfg.min_hold_days} 交易日）",
+                    result,
                 )
 
             # 买入信号
             tranches = self._tranches_bought.get(code, 0)
             buy_setup = (
                 score < cfg.buy_threshold
-                and tranches < cfg.entry_tranches
+                and tranches < entry_tranches
                 and result.liquidity_ok
                 and not self._circuit_breaker_active
             )
@@ -114,14 +144,16 @@ class IPOStrategy:
                     score,
                     "买入门禁: " + "；".join(result.buy_block_reasons),
                     result.atr,
+                    result,
                 )
             if buy_setup:
                 return Decision(
                     code,
                     Signal.BUY,
                     score,
-                    self._buy_reason(result, tranches),
+                    self._buy_reason(result, tranches, entry_tranches, is_ipo),
                     result.atr,
+                    result,
                 )
 
             # HOLD
@@ -132,10 +164,16 @@ class IPOStrategy:
                     score,
                     "流动性不足（日成交额低于阈值）",
                     result.atr,
+                    result,
                 )
             if self._circuit_breaker_active:
                 return Decision(
-                    code, Signal.HOLD, score, "组合熔断激活，当日暂停买入", result.atr
+                    code,
+                    Signal.HOLD,
+                    score,
+                    "组合熔断激活，当日暂停买入",
+                    result.atr,
+                    result,
                 )
             return Decision(
                 code,
@@ -143,6 +181,7 @@ class IPOStrategy:
                 score,
                 f"综合风险适中 (score={score:.1f})，观望",
                 result.atr,
+                result,
             )
 
     def _sell_or_hold(
@@ -152,10 +191,11 @@ class IPOStrategy:
         atr: float | None,
         sell_reason: str,
         hold_reason: str,
+        result: SignalResult,
     ) -> Decision:
         if not self._can_sell(code):
-            return Decision(code, Signal.HOLD, score, hold_reason, atr)
-        return Decision(code, Signal.SELL, score, sell_reason, atr)
+            return Decision(code, Signal.HOLD, score, hold_reason, atr, result)
+        return Decision(code, Signal.SELL, score, sell_reason, atr, result)
 
     # ── 熔断 ────────────────────────────────────────────────────────────
     def set_daily_baseline(self, value: float) -> None:
@@ -205,6 +245,7 @@ class IPOStrategy:
         price: float,
         qty: float,
         buy_date: date | None = None,
+        origin: str = "regular",
     ) -> None:
         """记录一笔已确认成交的买入。"""
         with self._lock:
@@ -215,6 +256,7 @@ class IPOStrategy:
             )
             self._peak_prices[code] = max(price, self._peak_prices.get(code, price))
             self._tranches_bought[code] = self._tranches_bought.get(code, 0) + 1
+            self._position_origins.setdefault(code, _normalize_origin(origin))
 
     def clear_position(self, code: str) -> None:
         with self._lock:
@@ -222,6 +264,7 @@ class IPOStrategy:
             self._buy_dates.pop(code, None)
             self._peak_prices.pop(code, None)
             self._tranches_bought.pop(code, None)
+            self._position_origins.pop(code, None)
 
     def restore_position(
         self,
@@ -231,12 +274,18 @@ class IPOStrategy:
         buy_date: date,
         tranches_bought: int,
         peak_price: float,
+        origin: str = "regular",
     ) -> None:
         with self._lock:
             self._cost_basis[code] = [qty, avg_cost * qty]
             self._buy_dates[code] = buy_date
             self._peak_prices[code] = peak_price
             self._tranches_bought[code] = tranches_bought
+            self._position_origins[code] = _normalize_origin(origin)
+
+    def set_ipo_codes(self, codes: set[str]) -> None:
+        with self._lock:
+            self._ipo_codes = set(codes)
 
     def get_active_codes(self) -> set[str]:
         with self._lock:
@@ -264,12 +313,24 @@ class IPOStrategy:
         with self._lock:
             return code in self._cost_basis
 
+    def get_origin(self, code: str) -> str:
+        with self._lock:
+            return self._position_origins.get(code, "regular")
+
     # ── 内部 ────────────────────────────────────────────────────────────
     def _avg_cost(self, code: str) -> float | None:
         basis = self._cost_basis.get(code)
         if basis is None or basis[0] <= 0:
             return None
         return basis[1] / basis[0]
+
+    def _is_ipo_code_locked(self, code: str) -> bool:
+        return self._position_origins.get(code) == "ipo" or code in self._ipo_codes
+
+    def _entry_tranches_for_locked(self, code: str) -> int:
+        if self._is_ipo_code_locked(code):
+            return max(1, self._cfg.ipo_entry_tranches)
+        return max(1, self._cfg.entry_tranches)
 
     def _can_sell(self, code: str, current_date: date | None = None) -> bool:
         if self._cfg.min_hold_days <= 0:
@@ -280,10 +341,16 @@ class IPOStrategy:
         today = current_date or market_date(self._cfg.market_timezone)
         return _trading_days_between(buy_date, today) >= self._cfg.min_hold_days
 
-    def _buy_reason(self, r: SignalResult, current_tranches: int) -> str:
+    def _buy_reason(
+        self,
+        r: SignalResult,
+        current_tranches: int,
+        entry_tranches: int,
+        is_ipo: bool,
+    ) -> str:
         parts = [
             f"综合风险低 (score={r.composite_score:.1f})",
-            f"第{current_tranches + 1}/{self._cfg.entry_tranches}批",
+            f"{'IPO' if is_ipo else ''}第{current_tranches + 1}/{entry_tranches}批",
         ]
         if r.capital_score < 30:
             parts.append("机构净买入")
@@ -329,3 +396,8 @@ def _trading_days_between(start: date, end: date) -> int:
             days += 1
         d += timedelta(days=1)
     return days
+
+
+def _normalize_origin(value: str | None) -> str:
+    origin = str(value or "regular").strip().lower()
+    return "ipo" if origin == "ipo" else "regular"

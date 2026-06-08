@@ -159,6 +159,33 @@ def test_position_ratio_zero_disables_new_buy() -> None:
     assert "单批预算不足" in trader.last_failure_reason
 
 
+def test_ipo_sizing_profile_can_buy_when_regular_ratio_is_zero() -> None:
+    trade_ctx = _FilledTradeContext()
+    trader = Trader(
+        trade_ctx=trade_ctx,  # type: ignore[arg-type]
+        data=_BuyingData(power=200_000.0, net_assets=100_000.0),  # type: ignore[arg-type]
+        config=StrategyConfig(
+            max_positions=0,
+            entry_tranches=2,
+            position_ratio=0.0,
+            order_fill_timeout_s=0.01,
+            order_poll_interval_s=0.01,
+        ),
+    )
+
+    ok, _fill_price, _filled = trader.buy(
+        "HK.06680",
+        current_price=10.0,
+        lot_size=100,
+        is_new_position=True,
+        position_ratio=0.05,
+        entry_tranches=2,
+    )
+
+    assert ok
+    assert trade_ctx.last_order["qty"] == 200
+
+
 def test_real_buy_does_not_fallback_to_cash_when_power_is_zero() -> None:
     trade_ctx = _FilledTradeContext()
     trader = Trader(

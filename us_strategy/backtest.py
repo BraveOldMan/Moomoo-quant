@@ -398,24 +398,32 @@ class BacktestEngine:
         in_pos = code in positions
         tranches = positions[code]["tranches"] if in_pos else 0
         can_exit = in_pos and self._can_exit(positions[code], dt)
-
-        # 浮动止损优先
-        if in_pos and cfg.use_trailing_stop:
-            pos = positions[code]
-            peak = pos.get("peak", pos["avg"])
-            if close > peak:
-                pos["peak"] = peak = close
-            if (
-                can_exit
-                and peak > 0
-                and (peak - close) / peak >= cfg.trailing_stop_pct
-            ):
-                return self._exit(dt, code, close, cash, positions, trades), True
+        is_ipo = code in self._listing_dates or (
+            in_pos and positions[code].get("origin") == "ipo"
+        )
+        entry_tranches = cfg.ipo_entry_tranches if is_ipo else cfg.entry_tranches
 
         # 固定止损
         if in_pos and can_exit:
             avg = positions[code]["avg"]
-            if avg > 0 and (avg - close) / avg >= cfg.stop_loss_pct:
+            stop_loss_pct = cfg.ipo_stop_loss_pct if is_ipo else cfg.stop_loss_pct
+            if avg > 0 and (avg - close) / avg >= stop_loss_pct:
+                return self._exit(dt, code, close, cash, positions, trades), True
+
+        # IPO 固定止盈优先于浮动退出
+        if in_pos and can_exit and is_ipo:
+            avg = positions[code]["avg"]
+            if avg > 0 and (close - avg) / avg >= cfg.ipo_take_profit_pct:
+                return self._exit(dt, code, close, cash, positions, trades), True
+
+        # 浮动止损优先于综合风险卖出
+        if in_pos and (cfg.use_trailing_stop or is_ipo):
+            pos = positions[code]
+            peak = pos.get("peak", pos["avg"])
+            if close > peak:
+                pos["peak"] = peak = close
+            trailing_pct = cfg.ipo_trailing_stop_pct if is_ipo else cfg.trailing_stop_pct
+            if can_exit and peak > 0 and (peak - close) / peak >= trailing_pct:
                 return self._exit(dt, code, close, cash, positions, trades), True
 
         # 出货
@@ -427,7 +435,7 @@ class BacktestEngine:
         liquidity_ok = turnover_usd >= cfg.min_daily_turnover_usd
         if (
             score < cfg.buy_threshold
-            and tranches < cfg.entry_tranches
+            and tranches < entry_tranches
             and liquidity_ok
             and can_open
             and not buy_block_reasons
@@ -439,7 +447,8 @@ class BacktestEngine:
                 )
                 qty = sized.qty
             else:
-                budget = cash * cfg.position_ratio / cfg.entry_tranches
+                position_ratio = cfg.ipo_position_ratio if is_ipo else cfg.position_ratio
+                budget = cash * position_ratio / entry_tranches
                 qty = int(budget / close) if close > 0 else 0
             cost, comm = self._gross_cost(qty, close)
             if qty > 0 and cash >= cost:
@@ -458,6 +467,7 @@ class BacktestEngine:
                         "tranches": 1,
                         "peak": close,
                         "buy_date": _to_date(dt),
+                        "origin": "ipo" if is_ipo else "regular",
                     }
                 trades.append(TradeRecord(dt, code, "BUY", close, qty, comm))
         return cash, False

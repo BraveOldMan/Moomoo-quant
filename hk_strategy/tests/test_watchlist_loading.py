@@ -8,6 +8,7 @@ import moomoo as ft
 from hk_strategy.config import StrategyConfig, _load_watchlist
 from hk_strategy.main import (
     _FailureAlertGate,
+    _OnceEventGate,
     _account_snapshot_text,
     _buy_failure_once_key,
     _buy_alert_message,
@@ -101,6 +102,15 @@ def test_failure_alert_gate_sends_once_for_deterministic_reason() -> None:
     assert gate.should_send("买入未执行", "HK.00700", once_key=once_key) is False
     assert gate.should_send("买入未执行", "HK.09988", once_key=once_key) is True
     assert gate.should_send("卖出失败", "HK.00700", once_key=once_key) is True
+
+
+def test_once_event_gate_dedupes_ipo_key_events() -> None:
+    gate = _OnceEventGate()
+
+    assert gate.should_send("发现今日IPO", "HK.06680") is True
+    assert gate.should_send("发现今日IPO", "HK.06680") is False
+    assert gate.should_send("IPO首次分析", "HK.06680") is True
+    assert gate.should_send("发现今日IPO", "HK.09999") is True
 
 
 def test_buy_failure_once_key_only_matches_max_position_block() -> None:

@@ -67,6 +67,10 @@ EXPECTED_TASKS: tuple[dict[str, Any], ...] = (
     },
 )
 
+# Windows Task Scheduler LastTaskResult values that are non-error terminal/running
+# states for this read-only health check.
+_ACCEPTED_LAST_TASK_RESULTS = (None, 0, 267009, 267011, 267014)
+
 
 @dataclass(frozen=True)
 class TaskCheck:
@@ -140,7 +144,7 @@ def validate_task_records(
             messages.append(
                 f"execution time limit mismatch: {actual_limit or 'unknown'}"
             )
-        if last_result not in (None, 0, 267011, 267014):
+        if last_result not in _ACCEPTED_LAST_TASK_RESULTS:
             messages.append(f"last task result is abnormal: {last_result}")
 
         checks.append(
