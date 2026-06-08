@@ -71,6 +71,7 @@ _SHUTDOWN = object()  # 队列哨兵
 _DISPLAY_NAME_FIELDS = ("name", "stock_name", "security_name", "short_name")
 _EMPTY_DISPLAY_NAMES = {"", "nan", "none", "n/a", "na", "--"}
 _BUY_FAILURE_ALERT_SUPPRESS_MARKERS = ("资金不足", "预算不足")
+_BUY_FAILURE_ALERT_ONCE_MARKERS = ("已达最大持仓数",)
 
 
 def _hhmm(s: str) -> _time:
@@ -115,14 +116,22 @@ class _FailureAlertGate:
     def __init__(self, cooldown_s: float) -> None:
         self._cooldown_s = max(0.0, cooldown_s)
         self._last_sent: dict[tuple[str, str], float] = {}
+        self._sent_once: set[tuple[str, str, str]] = set()
 
     def should_send(
         self,
         event: str,
         code: str,
         now: float | None = None,
+        once_key: str | None = None,
     ) -> bool:
         """返回当前失败事件是否应发送提醒。时间口径为 monotonic 秒。"""
+        if once_key is not None:
+            key_once = (event, code, once_key)
+            if key_once in self._sent_once:
+                return False
+            self._sent_once.add(key_once)
+            return True
         if self._cooldown_s <= 0:
             return True
         current = time.monotonic() if now is None else now
@@ -145,6 +154,14 @@ def _should_ignore_unheld_sell(
 def _should_suppress_buy_failure_alert(reason: str) -> bool:
     """资金/预算不足属于预期阻断，只写日志，不反复打扰飞书群。"""
     return any(marker in reason for marker in _BUY_FAILURE_ALERT_SUPPRESS_MARKERS)
+
+
+def _buy_failure_once_key(reason: str) -> str | None:
+    """返回需要同一标的一次性提醒的买入失败类别。"""
+    for marker in _BUY_FAILURE_ALERT_ONCE_MARKERS:
+        if marker in reason:
+            return marker
+    return None
 
 
 def _fetch_recent_ipos(
@@ -525,10 +542,18 @@ def run() -> None:
             logger.warning("未知组合熔断基准 %s，将降级为 first_seen", mode)
         baseline_set_date["d"] = today
 
-    def send_failure_alert(event: str, code: str, message: str) -> None:
-        """发送失败提醒；同一事件/标的在冷却期内只写日志。"""
-        if failure_alert_gate.should_send(event, code):
+    def send_failure_alert(
+        event: str,
+        code: str,
+        message: str,
+        once_key: str | None = None,
+    ) -> None:
+        """发送失败提醒；支持冷却期和确定性阻断的一次性提醒。"""
+        if failure_alert_gate.should_send(event, code, once_key=once_key):
             alerts.send(event, message)
+            return
+        if once_key is not None:
+            logger.info("一次性失败提醒已发送，跳过 %s %s: %s", event, code, message)
             return
         logger.info("失败提醒冷却中，跳过 %s %s: %s", event, code, message)
 
@@ -617,6 +642,7 @@ def run() -> None:
                     "买入未执行",
                     code,
                     message,
+                    once_key=_buy_failure_once_key(reason),
                 )
 
         elif decision.signal == Signal.SELL:

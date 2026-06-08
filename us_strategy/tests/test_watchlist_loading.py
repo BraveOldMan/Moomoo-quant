@@ -11,6 +11,7 @@ from us_strategy.config import StrategyConfig, _load_watchlist
 from us_strategy.main import (
     _FailureAlertGate,
     _account_snapshot_text,
+    _buy_failure_once_key,
     _buy_alert_message,
     _sync_broker_positions,
     _snapshot_display_name,
@@ -83,6 +84,22 @@ def test_zero_cooldown_failure_alert_gate_never_throttles() -> None:
 
     assert gate.should_send("买入失败", "US.AAPL", now=1000.0) is True
     assert gate.should_send("买入失败", "US.AAPL", now=1001.0) is True
+
+
+def test_failure_alert_gate_sends_once_for_deterministic_reason() -> None:
+    gate = _FailureAlertGate(cooldown_s=0.0)
+
+    once_key = _buy_failure_once_key("已达最大持仓数 8")
+    assert once_key == "已达最大持仓数"
+    assert gate.should_send("买入未执行", "US.AAPL", once_key=once_key) is True
+    assert gate.should_send("买入未执行", "US.AAPL", once_key=once_key) is False
+    assert gate.should_send("买入未执行", "US.MSFT", once_key=once_key) is True
+    assert gate.should_send("卖出失败", "US.AAPL", once_key=once_key) is True
+
+
+def test_buy_failure_once_key_only_matches_max_position_block() -> None:
+    assert _buy_failure_once_key("已达最大持仓数 8") == "已达最大持仓数"
+    assert _buy_failure_once_key("订单未成交或超时") is None
 
 
 def test_ignore_unheld_sell_only_when_strategy_and_broker_are_flat() -> None:
