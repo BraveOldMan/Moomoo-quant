@@ -1,389 +1,637 @@
-# Moomoo-quant · 美股/港股多因子量化交易系统
+# Moomoo Quant
 
-> 当前版本：v1.8.0（2026-06-09）
+> Current version: `v1.8.0` (2026-06-09)
 
-基于 **moomoo OpenD 网关**（原 Futu API）的美股（US）与港股（HK）程序化交易系统：从行情采集、多因子评分、决策（PDT/港股午休/熔断/加权成本）、限价执行、持仓恢复，到回测、因子 IC 校准、前向样本采集与每日自动体检，形成完整闭环：
+Moomoo Quant is a dual-market quantitative trading and research framework built on top of the
+moomoo OpenD gateway, formerly known as the Futu OpenAPI gateway. It covers both US equities and
+Hong Kong equities, with shared strategy architecture and market-specific execution rules.
 
+The project is designed as a full research-to-simulation loop:
+
+```text
+market data -> factor scoring -> decision engine -> simulated execution
+            -> persistence -> forward IC calibration -> research reports
 ```
-采集 → 评分 → 决策 → 执行 → 持久化 → 校准 → 再优化
+
+This repository is intended for research, simulation, data collection, and engineering reference.
+It is not investment advice and is not a turnkey live-trading system.
+
+## Scope
+
+Supported markets:
+
+| Market | Package | Code format | Examples |
+| --- | --- | --- | --- |
+| US equities | `us_strategy/` | `US.SYMBOL` | `US.AAPL`, `US.TSLA`, `US.NVDA` |
+| Hong Kong equities | `hk_strategy/` | `HK.00000` | `HK.00700`, `HK.09988`, `HK.03690` |
+
+This project does not cover A-shares, futures execution, cryptocurrency execution, or wallet-based
+trading.
+
+The repository includes:
+
+- Strategy code for US and HK simulated trading.
+- Shared research, backtesting, IC diagnostics, and reporting tools.
+- Forward signal collection and scheduled-task validation tools.
+- Microstructure feature collection helpers.
+- Local development instructions and safety rules.
+
+The repository intentionally excludes:
+
+- Live account credentials and trading passwords.
+- Local SQLite databases.
+- OpenD runtime logs.
+- Generated backtest reports and charts.
+- SDK vendor directories such as `MMAPI4Python_*`.
+- Any proprietary data export that should not be redistributed.
+
+## Safety First
+
+The default runtime environment is simulation:
+
+```text
+TRADE_ENV=SIMULATE
 ```
 
-> **市场范围**：`us_strategy/` 面向美股，股票代码统一 `US.` 前缀（如 `US.AAPL`、`US.TSLA`）；`hk_strategy/` 面向港股，股票代码统一 `HK.` 前缀且 5 位补零（如 `HK.00700`、`HK.09988`）。不涉及 A 股。
+Live trading is guarded by three independent requirements:
 
----
+1. `TRADE_ENV=REAL`
+2. `ALLOW_REAL_TRADING=yes`
+3. `TRADE_PASSWORD` must be set so the moomoo trade context can be unlocked.
 
-## 目录
+The simulation launcher scripts explicitly set `TRADE_ENV=SIMULATE` and remove live-trading unlock
+variables. Do not bypass this behavior unless you have reviewed the code, OpenD account state,
+broker permissions, market data permissions, and all order-size controls.
 
-- [前置条件与安装](#前置条件与安装)
-- [快速开始](#快速开始)
-- [系统架构](#系统架构)
-- [模块清单](#模块清单)
-- [因子体系](#因子体系)
-- [因子校准闭环](#因子校准闭环)
-- [配置（环境变量）](#配置环境变量)
-- [moomoo API 限频](#moomoo-api-限频)
-- [v1.8.0 变更摘要](#v180-变更摘要)
-- [数据持久化](#数据持久化)
-- [测试](#测试)
-- [关键约定](#关键约定)
-- [自动化计划任务](#自动化计划任务)
-- [港股版 hk_strategy](#港股版-hk_strategy)
-- [风险提示](#风险提示)
+Expected buy failures caused by insufficient cash or budget are treated as log-only events to avoid
+alert spam. They are not silently converted into successful orders.
 
----
+## Architecture
 
-## 前置条件与安装
+All broker and market-data calls go through the local OpenD gateway:
 
-1. **启动 moomoo OpenD 网关**（API 必须经其中转，不直连交易所）
-   - 默认地址 `127.0.0.1:11111`
-   - 下载：<https://openapi.moomoo.com/moomoo-api-doc/en/quick/opend-base.html>
-2. **安装依赖**
-   ```bash
-   pip install moomoo-api          # 或 pip install -e MMAPI4Python_10.7.6708/
-   ```
-   - 核心：`pandas`、`simplejson`、`protobuf>=3.20.0`、`PyCryptodome`
-   - 策略可选：`talib`（技术指标）
+```text
+strategy code -> moomoo Python SDK -> TCP 127.0.0.1:11111 -> OpenD -> market data / broker API
+```
 
-## 快速开始
+The two core SDK contexts are:
 
-```bash
-# 美股数据可得性探针（上线前必跑，确认各接口字段可用）
-python -m us_strategy.probe US.RDDT US.ARM
+| SDK context | Purpose |
+| --- | --- |
+| `OpenQuoteContext` | Quotes, historical candles, market snapshots, order book, ticker, broker queue, screeners |
+| `OpenSecTradeContext` | Orders, account info, positions, fills, order history |
 
-# 港股数据可得性探针（上线前必跑，确认各接口字段可用）
+Every SDK call returns a `(ret_code, data)` tuple. Code must check `ret_code == RET_OK` before
+using `data`; on failure, `data` is usually an error string.
+
+### Package Layout
+
+```text
+.
+|-- us_strategy/              # US equity strategy package
+|-- hk_strategy/              # Hong Kong equity strategy package
+|-- research/                 # IC diagnostics, walk-forward research, backtest reports
+|-- tools/                    # Data collection, health checks, task validators, utilities
+|-- skills/                   # Codex local skill metadata for project workflows
+|-- moomoo_rate_limits.py     # Conservative moomoo API rate-limit facts
+|-- dark_pool_proxy.py        # Large-print proxy tracker based on visible moomoo ticks
+|-- order_book_l2.py          # L2 order-book imbalance and pressure utilities
+|-- ipo_runtime.py            # Today-IPO runtime helpers
+|-- ipo_watchlist.py          # IPO watchlist persistence helpers
+|-- AGENTS.md                 # Repository-specific development rules
+|-- CLAUDE.md                 # Additional local development notes
+`-- VERSION                   # Current project version
+```
+
+### Strategy Package Layout
+
+Both `us_strategy/` and `hk_strategy/` follow the same shape:
+
+| Module | Responsibility |
+| --- | --- |
+| `main.py` | Runtime entrypoint. Single-threaded event consumption for decisions and order submission |
+| `config.py` | Environment-driven `StrategyConfig`, feature switches, weights, thresholds |
+| `data_access.py` | TTL cache and token-bucket facade for quote/trade data |
+| `features.py` | Pure factor scoring functions shared by live/sim and backtest logic |
+| `signals.py` | Data retrieval, score composition, `SignalResult`, universe profiling |
+| `strategy.py` | Decision engine: weighted cost, PDT/min-hold rules, circuit breaker, stop logic |
+| `trader.py` | Marketable-limit execution, fill polling, add/open distinction |
+| `persistence.py` | SQLite position recovery and forward signal logging |
+| `monitor.py` | Realtime quote subscription |
+| `alerts.py` | Email, Telegram, and Feishu/Lark alert adapters |
+| `market_calendar.py` | Market holiday and trading-day logic |
+| `backtest.py` | Source-aligned backtest engine with cost model and risk metrics |
+| `analysis.py` | IC/IR, quantile tests, event studies, forward IC from logs |
+| `probe.py` | Data availability probe before running strategies |
+| `forward_monitor.py` | Forward scoring logger. It does not place orders |
+| `ic_report.py` | Daily forward IC health report |
+
+## Market Differences
+
+| Dimension | US strategy | HK strategy |
+| --- | --- | --- |
+| Package | `us_strategy` | `hk_strategy` |
+| Code prefix | `US.` | `HK.` with five-digit code |
+| Time zone | `America/New_York` | `Asia/Hong_Kong` |
+| Regular session | 09:30-16:00 continuous | 09:30-12:00 and 13:00-16:00 |
+| Lunch break | No | Yes |
+| Calendar | NYSE calendar | HKEX API first, hard-coded holiday fallback |
+| Minimum holding | PDT-aware, default `MIN_HOLD_DAYS=1` | No PDT, default `MIN_HOLD_DAYS=0` |
+| Cost model | Per-share commission | Turnover percentage, stamp duty, exchange fees |
+| Benchmark | `US.SPY` | `HK.800000` |
+| Lot size | 1 share | Broker lot size is queried and respected |
+| Default position DB | `us_strategy/positions.db` | `hk_strategy/positions.db` |
+
+HK-specific factors must be calibrated on HK samples. Do not reuse US IC conclusions directly.
+
+## Installation
+
+### 1. Install moomoo OpenD
+
+OpenD must be running before any SDK calls can connect.
+
+- Default host: `127.0.0.1`
+- Default port: `11111`
+- OpenD documentation: <https://openapi.moomoo.com/moomoo-api-doc/en/quick/opend-base.html>
+
+### 2. Create a Python environment
+
+```powershell
+git clone https://github.com/BraveOldMan/moomoo-quant.git
+Set-Location .\moomoo-quant
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+```
+
+### 3. Install dependencies
+
+Install the official moomoo API package:
+
+```powershell
+python -m pip install moomoo-api
+```
+
+If you have a local SDK checkout, you can install it instead:
+
+```powershell
+python -m pip install -e .\MMAPI4Python_10.7.6708
+```
+
+Core runtime dependencies used by the repository include:
+
+- `pandas`
+- `simplejson`
+- `protobuf>=3.20.0`
+- `PyCryptodome`
+- `moomoo-api`
+
+Research, testing, and optional feature dependencies include:
+
+- `pytest`
+- `ruff`
+- `numpy`
+- `matplotlib`
+- `talib` or a compatible TA-Lib installation, if you enable TA features
+- `optuna`, `quantstats`, and `vectorbt`, if you run optional research steps
+
+This repository currently does not ship a pinned `requirements.txt`. Use an isolated virtual
+environment and pin versions in your own deployment if you need reproducibility.
+
+## Quick Start
+
+### Run tests that do not need OpenD
+
+```powershell
+python -m pytest -q
+python -m ruff check .
+```
+
+Run market-specific tests:
+
+```powershell
+python -m pytest us_strategy/tests -q
+python -m pytest hk_strategy/tests -q
+python -m pytest research/tests tools/tests -q
+```
+
+### Probe data availability
+
+These commands require OpenD and the relevant market-data permissions:
+
+```powershell
+python -m us_strategy.probe US.AAPL US.TSLA
 python -m hk_strategy.probe HK.00700 HK.09988
+```
 
-# 运行美股策略（推荐：显式模拟盘；自动加载 watchlist.txt + IPO 扫描）
-powershell -ExecutionPolicy Bypass -File us_strategy/run_simulate.ps1
+Run probes before enabling a symbol in a watchlist. Some moomoo endpoints are not uniformly
+available across markets, accounts, data packages, or trading sessions.
 
-# 运行港股策略（推荐：显式模拟盘；自动加载 watchlist.txt + IPO 扫描）
-powershell -ExecutionPolicy Bypass -File hk_strategy/run_simulate.ps1
+### Run simulated strategies
 
-# 直接运行模块时默认也是模拟盘；推荐启动脚本可清理残留实盘环境变量
+Recommended launchers:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File us_strategy\run_simulate.ps1
+powershell -ExecutionPolicy Bypass -File hk_strategy\run_simulate.ps1
+```
+
+Direct module entrypoints also default to simulation:
+
+```powershell
 python -m us_strategy.main
 python -m hk_strategy.main
+```
 
-# 临时覆盖观察列表（按目标策略使用 US. 或 HK. 前缀）
-WATCHLIST=US.AAPL,US.TSLA python -m us_strategy.main
-WATCHLIST=HK.00700,HK.09988 python -m hk_strategy.main
+Override watchlists temporarily:
 
-# 正式回测报告（BacktestEngine 的 CLI 包装入口）
-python -m research.run_backtest_report --market us --codes US.AAPL,US.MSFT --start 2024-01-01 --end 2024-03-31
-python -m research.run_backtest_report --market hk --codes HK.00700,HK.09988 --start 2024-01-01 --end 2024-03-31
+```powershell
+$env:WATCHLIST = "US.AAPL,US.TSLA"
+python -m us_strategy.main
 
-# 前向日志采集（只评分写库、不下单，为因子校准攒样本）
+$env:WATCHLIST = "HK.00700,HK.09988"
+python -m hk_strategy.main
+```
+
+Use `US.` prefixes for US symbols and `HK.` prefixes for HK symbols.
+
+## Watchlists and IPO Flow
+
+Runtime universe:
+
+```text
+today IPOs + watchlist + current broker/local positions
+```
+
+Watchlist sources:
+
+| Source | Behavior |
+| --- | --- |
+| `WATCHLIST` env var | Highest priority, comma-separated codes |
+| `WATCHLIST_FILE` env var | Custom watchlist file path |
+| `us_strategy/watchlist.txt` | Default US watchlist |
+| `hk_strategy/watchlist.txt` | Default HK watchlist |
+
+Watchlist file format:
+
+```text
+# comments are allowed
+US.AAPL
+US.TSLA,US.NVDA
+```
+
+IPO watchlist files use:
+
+```text
+YYYY-MM-DD<TAB>CODE<TAB>NAME<TAB>LIST_TIME
+```
+
+Today-IPO entries are stored separately from mature-stock watchlists:
+
+- `us_strategy/ipo_watchlist.txt`
+- `hk_strategy/ipo_watchlist.txt`
+
+Today IPOs have their own sizing and risk profile:
+
+| Setting | Default |
+| --- | ---: |
+| `IPO_POSITION_RATIO` | `0.05` |
+| `IPO_ENTRY_TRANCHES` | `2` |
+| `IPO_TAKE_PROFIT_PCT` | `0.12` |
+| `IPO_STOP_LOSS_PCT` | `0.06` |
+| `IPO_TRAILING_STOP_PCT` | `0.08` |
+
+If real prices or turnover are not ready, the IPO candidate is observed and blocked from trading
+until it becomes analyzable.
+
+## Factor Model
+
+All `*_score` values are 0-100 risk scores:
+
+```text
+0   = low risk / more bullish
+100 = high risk / more bearish
+```
+
+For a useful factor, forward IC should usually be significantly negative.
+
+Default active decision weights:
+
+| Factor | Default weight |
+| --- | ---: |
+| `capital` | `0.55` |
+| `turnover` | `0.25` |
+| `momentum` | `0.20` |
+
+Extended factors are usually disabled or weight-zero until forward IC validates them:
+
+| Group | Example score keys | Main source | Default state |
+| --- | --- | --- | --- |
+| Core | `turnover`, `capital`, `momentum` | snapshot, capital distribution, candles | Active |
+| Technical | `orb`, `rs`, `vwap` | historical K-line, intraday candles | Off / zero weight |
+| Microstructure | `order_flow`, `dark_pool_proxy`, `obi`, `l2_imbalance`, `intraday_flow` | ticker, order book, capital flow | Off / zero weight |
+| HK-specific | `broker`, `hk_status` | broker queue, `dark_status`, `sec_status` | Off / zero weight |
+| Short side | `short` | short interest, short volume | Off / zero weight |
+| Options | `option_iv` | option chain and snapshots | Warning-only by default |
+
+`dark_pool_proxy` is only a proxy based on large visible moomoo real-time ticks. It is not FINRA TRF
+dark-pool data.
+
+## Forward IC Calibration
+
+Microstructure factors generally do not have a full historical replay source. They are collected
+forward and calibrated over time:
+
+```text
+forward_monitor.py
+    -> writes signal_log with scores@T and price@T
+ic_report.py
+    -> computes daily cross-sectional forward IC for 15/30 minute horizons
+    -> writes ic_history
+IC gate
+    -> >= 20 trading days
+    -> |mean IC| > 0.03
+    -> |IR| > 0.5
+    -> expected sign is negative
+```
+
+Commands:
+
+```powershell
 python -m us_strategy.forward_monitor
 python -m hk_strategy.forward_monitor
 
-# 前向 IC 累计体检
 python -m us_strategy.ic_report
 python -m hk_strategy.ic_report
-
-# 本地自动化与数据健康检查（只读）
-python -m tools.check_moomoo_tasks
-python -m tools.check_moomoo_data_health --db us_strategy/history_data.db --markets US,HK
-python -m tools.microstructure_features --db us_strategy/history_data.db --codes US.AAPL,HK.00700
-
-# 运行单测（无需 OpenD）
-pytest us_strategy/tests/ -q
-pytest hk_strategy/tests/ -q
 ```
 
-## 系统架构
+Forward monitors only log scores. They do not place orders.
 
-### 通信架构
+## Research and Backtesting
 
-```
-策略代码 → moomoo Python SDK → TCP(11111) → OpenD 网关 → 交易所/行情源
-```
+Backtest report CLI:
 
-两大核心 Context（均继承 `OpenContextBase`，管理连接/心跳/重连）：
-
-| 类 | 用途 |
-|---|---|
-| `OpenQuoteContext` | 行情订阅、历史 K 线、快照、筛股、微观结构 |
-| `OpenSecTradeContext` | 下单、查仓位/账户/成交 |
-
-### 数据流
-
-- **同步查询**：阻塞返回 `(ret_code, DataFrame)`，须先检查 `ret_code == RET_OK`
-- **异步推送**：订阅后回调，继承 `*HandlerBase` 重写 `on_recv_rsp()`
-
-### 策略分层（`us_strategy/`）
-
-```
-main.py            单线程事件队列编排（推送+轮询统一投递，串行消费，无并发下单竞态）
-                   universe = IPO 扫描 ∪ 自选清单(WATCHLIST) ∪ 现有持仓
-  ├─ data_access.py    TTL 缓存 + 令牌桶限流的行情/交易数据门面（防撞频）
-  ├─ signals.py        经 data_access 取数 → 调 features 评分；缺失因子自动降级
-  │   └─ features.py   统一特征 + 纯函数评分（实盘/回测共用）
-  ├─ strategy.py       决策核心：加权成本、PDT、熔断基准锚定、RLock 加锁
-  ├─ trader.py         marketable-limit 限价执行 + 成交轮询 + 新开/加仓区分
-  ├─ persistence.py    SQLite 持仓恢复 + SignalLogStore 前向信号日志
-  ├─ market_calendar.py / clock.py   NYSE 假日表 + 纽约市场日工具
-  └─ alerts.py / monitor.py          多渠道告警 / 实时行情订阅
-
-backtest.py        同源回测 + 佣金/滑点 + SPY 基准/Alpha + Sharpe/Sortino/Calmar + walk-forward
-analysis.py        因子 IC/IR、分层回测、锁定期事件研究(CAR) + forward_ic_from_log（微观因子前向校准）
-probe.py           数据可得性探针
-forward_monitor.py 前向日志采集（只写 signal_log，不下单）
-ic_report.py       每日 IC 累计体检（signal_log → ic_history，自动判定因子是否够格赋权）
+```powershell
+python -m research.run_backtest_report --market us --codes US.AAPL,US.MSFT --start 2024-01-01 --end 2024-03-31
+python -m research.run_backtest_report --market hk --codes HK.00700,HK.09988 --start 2024-01-01 --end 2024-03-31
 ```
 
-## 模块清单
+Use local SQLite history as a research data source:
 
-| 模块 | 职责 |
-|---|---|
-| `main.py` | 入口；单线程事件循环编排 |
-| `config.py` | `StrategyConfig`（环境变量加载、因子开关、`active_weights()`）|
-| `data_access.py` | 数据门面：TTL 缓存 + 令牌桶限流，封装快照/K线/逐笔/盘口/资金流/做空/期权链 |
-| `features.py` | 纯函数因子评分（0–100 风险分）|
-| `signals.py` | 取数→评分→`SignalResult`；缺失因子降级；universe profile |
-| `strategy.py` | 决策核心：加权成本、PDT、熔断、止损 |
-| `trader.py` | 限价执行 + 成交轮询 |
-| `persistence.py` | `PositionStore`（持仓）+ `SignalLogStore`（信号日志）|
-| `monitor.py` | 实时行情订阅（QUOTE + 可选 TICKER/ORDER_BOOK）|
-| `alerts.py` | 邮件 / Telegram 等多渠道告警 |
-| `market_calendar.py` / `clock.py` | NYSE 假日 / 纽约时区工具 |
-| `backtest.py` | 回测引擎（成本、基准、风险指标、walk-forward）|
-| `analysis.py` | 因子有效性分析（IC/IR、分层、CAR、前向 IC）|
-| `probe.py` | 数据可得性探针 |
-| `forward_monitor.py` | 前向日志采集 |
-| `ic_report.py` | 前向 IC 累计体检 |
-
-## 因子体系
-
-所有 `*_score` 返回 **0–100 风险分**（0 = 低风险/偏多，100 = 高风险/偏空）。有效因子的 IC 应**显著为负**。
-
-| 组别 | 因子（`scores` 键）| 数据源 | 状态 |
-|---|---|---|---|
-| 核心 | turnover / capital / momentum | snapshot / capital_distribution | 历史默认已赋权，调权前仍须过 IC gate |
-| 技术 | orb / rs / vwap / ATR 仓位 | history_kline | 默认关闭、权重 0 |
-| 盘中微观结构 | order_flow(CVD) / dark_pool_proxy / obi / l2_imbalance / intraday_flow | rt_ticker / order_book / capital_flow | 默认关闭、权重 0 |
-| 港股微观状态 | broker / hk_status | broker_queue / snapshot dark_status / snapshot sec_status | 默认关闭、权重 0 |
-| 做空面 | short | short_interest / daily_short_volume | 默认关闭、权重 0 |
-| 期权隐含 | option_iv（IV skew + PCR）| option_chain + 期权 snapshot | 默认关闭、权重 0 |
-
-**生产决策权重**（`config.active_weights()`）：`capital 0.55 / turnover 0.25 / momentum 0.20`。
-扩展因子**必须先经 IC 校准（显著为负）才赋非零权重**，否则一律权重 0、不入决策。
-成熟股 watchlist 的策略升级应优先用 `research.signal_lab --source sqlite`
-复核 `capital / turnover / momentum / short` 的日度 IC/IR 和 gate 状态，再决定是否降权、反向或剔除。
-`dark_pool_proxy` 只是 moomoo 可见逐笔的大额成交代理信号，不是 FINRA TRF 暗池认证数据。
-
-## 因子校准闭环
-
-微观结构因子无历史回放，只能前向收集校准：
-
-```
-forward_monitor.py  每交易日盘中循环评分 → 写 signal_log (scores@T, price@T)
-        │           (扩展因子 force-enable，仅记录，不下单)
-        ▼
-ic_report.py        每日收盘后：每个交易日算一个横截面前向 IC(15/30min)
-        │           → 存 ic_history 表 → 跨日聚合 meanIC / IR(=均值/标准差)
-        ▼
-赋权闸门            ≥20 个交易日 且 |meanIC|>0.03 且 |IR|>0.5 且符号为负
-                    → "✅ 达标(可赋权)"；否则 "积累中 / 未达标 / 符号反(考虑反向)"
-```
-
-## 配置（环境变量）
-
-均可选、有默认值。美股完整列表见 `us_strategy/main.py` 顶部 docstring；港股完整列表见 `hk_strategy/main.py` 顶部 docstring。
-
-| 类别 | 变量 |
-|---|---|
-| 连接 | `OPEND_HOST` / `OPEND_PORT` |
-| 交易环境 | `TRADE_ENV`(SIMULATE/REAL) / `ALLOW_REAL_TRADING` / `TRADE_PASSWORD` |
-| universe | `WATCHLIST` / `WATCHLIST_FILE` / `IPO_DAYS_WINDOW` / `IPO_WATCHLIST_FILE` |
-| 港股流动性 | `MIN_DAILY_TURNOVER` |
-| 仓位 | `POSITION_RATIO` / `MAX_POSITIONS` / `ENTRY_TRANCHES` / `USE_ATR_SIZING` |
-| IPO 仓位 | `IPO_POSITION_RATIO` / `IPO_ENTRY_TRANCHES` |
-| 风控 | `STOP_LOSS_PCT` / `TRAILING_STOP_PCT` / `MIN_HOLD_DAYS`(PDT) / `DAILY_LOSS_LIMIT_PCT` / `CIRCUIT_BREAKER_BASELINE` |
-| IPO 风控 | `IPO_TAKE_PROFIT_PCT` / `IPO_STOP_LOSS_PCT` / `IPO_TRAILING_STOP_PCT` |
-| 执行 | `USE_LIMIT_ORDERS` / `LIMIT_PRICE_TOLERANCE_PCT` |
-| 因子开关 | `USE_RS` / `USE_ORB` / `USE_VWAP_SIGNAL` / `USE_ORDER_FLOW` / `USE_DARK_POOL_PROXY` / `USE_ORDER_BOOK_IMBALANCE` / `USE_L2_IMBALANCE_TRACKER` / `USE_INTRADAY_FLOW` / `USE_SHORT_METRICS` / `USE_OPTION_IV` / `USE_BROKER_SIGNAL` / `USE_BROKER_GATE` / `USE_HK_STATUS_SIGNAL` |
-| 告警 | `ALERT_EMAIL` / `TELEGRAM_TOKEN` / `TELEGRAM_CHAT_ID` / `FEISHU_CHAT_ID` / `LARK_CLI` |
-| 校准 | `MONITOR_INTERVAL_S` / `MONITOR_MAX_ROUNDS` / `IC_HORIZONS` / `IC_MIN_DAYS` / `DB_PATH` |
-
-## moomoo API 限频
-
-仓库级限频事实表在 `moomoo_rate_limits.py`，US/HK `StrategyConfig` 的默认 `api_rate_limit=28`、`api_rate_window_s=30` 从该表读取；这是给 `DataAccess` 的保守全局桶，覆盖资金流/资金分布等 30 次/30 秒接口并保留余量。可用 `API_RATE_LIMIT`、`API_RATE_WINDOW_S` 覆盖，但调高前必须按接口单独核对。
-
-高频接口默认规则：
-
-| 接口 | 官方/仓库规则 | 备注 |
-|---|---:|---|
-| `get_market_snapshot` | 60 次 / 30 秒；建议间隔 0.5 秒 | 单次最多 400 个标的；HK BMP 权限有更低单次数量上限 |
-| `request_history_kline` | 60 次 / 30 秒；建议间隔 0.5 秒 | 分页时只限制每只股票首页，后续页不计入该限频 |
-| `get_capital_flow` / `get_capital_distribution` | 30 次 / 30 秒；建议间隔 1 秒 | `DataAccess` 默认 28/30 秒覆盖这组接口 |
-| `get_option_expiration_date` | 60 次 / 30 秒；建议间隔 0.5 秒 | 期权链前置查询 |
-| `get_option_chain` | 10 次 / 30 秒；建议间隔 3 秒 | 日报和历史回填默认按 3 秒节流 |
-| `position_list_query` / `accinfo_query` / `order_list_query` | 10 次 / 30 秒 / 账户 | 只有 `refresh_cache=True` 时触发限频；策略默认读 OpenD 缓存 |
-| `place_order` | 15 次 / 30 秒 / 账户，连续请求间隔不低于 0.02 秒 | 实盘仍需人工确认，脚本不得自动启动实盘 |
-| `get_stock_quote` / `get_order_book` / `get_rt_ticker` / `get_rt_data` / `get_cur_kline` / `get_broker_queue` | 读取订阅后的 OpenD 推送缓存 | 不按服务器请求限频计算，但受订阅额度和数据权限约束 |
-
-没有在当前官方页面发布单接口频率的低频查询，统一在 `moomoo_rate_limits.py` 标记为 `official=False`，仓库默认按 30 次/30 秒保守处理，不允许把未知接口默认提到高频。
-
-## v1.8.0 变更摘要
-
-本版本新增 US/HK 今日 IPO 独立模拟交易流程：当天 IPO 不再混入普通 `watchlist.txt`，而是独立观察、独立仓位、独立止盈止损，并保留关键事件飞书卡片提醒。实盘仍保持 `TRADE_ENV=REAL` + `ALLOW_REAL_TRADING=yes` + `TRADE_PASSWORD` 三重门禁，不自动启动实盘。
-
-| 方向 | 变更 |
-|---|---|
-| 今日 IPO | US/HK 启动后按各自市场日扫描 `get_ipo_list`，仅将 `list_time == market_date` 的当日上市标的写入独立 `ipo_watchlist.txt` 并纳入模拟交易；旧记录只留痕，不进入当日交易 |
-| IPO 风控 | IPO 持仓持久化为 `origin=ipo`，重启后继续使用独立 `5% / 2批 / 止盈12% / 止损6% / 回撤8%` profile；普通自选股仍使用原 `POSITION_RATIO` 和止损/回撤参数 |
-| 主循环 | 启动/盘中定时扫描今日 IPO，写独立观察文件，订阅行情；真实价格和成交额未就绪时只发一次观察阻断，不下单 |
-| 飞书提醒 | IPO 仅发送发现、首次可分析、买卖/风控和扫描失败/关键阻断事件；继续走 `interactive` 卡片链路，避免轮询 HOLD 刷屏 |
-| 回测与验证 | 策略、交易、回测统一支持 IPO sizing profile 和 `origin` 恢复；普通 watchlist 小窗口回测报告已分别输出到 `report/outputs/backtest_report_ipo_change_us` 与 `report/outputs/backtest_report_ipo_change_hk` |
-| 自动化核验 | `tools.check_moomoo_tasks` 接受 Windows Task Scheduler `267009` 正在运行状态，避免把常驻任务误判为失败 |
-| 验证 | `python -m pytest -q` 401 项通过；`python -m ruff check .` 通过；`git diff --check` 通过；计划任务 strict 仅剩既有 `MoomooHKTickCollect last_task_result=2` 历史状态异常 |
-
-## v1.7.0 变更摘要
-
-本版本聚焦模拟交易执行闭环、分账户仓位口径、飞书账户快照和清仓恢复工具。实盘仍保持 `TRADE_ENV=REAL` + `ALLOW_REAL_TRADING=yes` + `TRADE_PASSWORD` 三重门禁，不自动启动实盘。
-
-| 方向 | 变更 |
-|---|---|
-| 模拟账户 | US/HK 模拟账户按独立资金口径配置仓位；美股模拟账户 `MAX_POSITIONS=8`、单标的目标 `6%`、`ENTRY_TRANCHES=2`，港股模拟账户因已接近满仓暂设 `POSITION_RATIO=0` 停止新增买入 |
-| 仓位算法 | 比例仓位按账户净值计算，再受现金/购买力约束，避免模拟保证金购买力放大下单；`ORDER_LOTS_PER_TRADE=0` 时启用净值比例仓位 |
-| 执行确认 | US/HK 订单成交轮询补充超时撤单后的状态复核，避免 `TIMEOUT:SUBMITTED;CANCEL_SENT` 误报已完全失败 |
-| 飞书提醒 | US/HK 买卖、失败和熔断提醒底部追加单行账户快照，包含资产净值、今日盈亏、持仓盈亏、持仓市值、购买力、维持保证金、现金和剩余流动性 |
-| 清仓恢复 | 新增 `tools/liquidate_us_sim_positions.py`，强制校验 `SIMULATE + US + acc_id` 后清空美股模拟持仓，并可在券商正持仓归零后清理本地 `positions` 缓存 |
-| 自动化核验 | `tools.check_moomoo_tasks` 增加模拟交易任务脚本参数检查，覆盖 US/HK 启动器仓位、订单类型和飞书群配置 |
-| 验证 | `pytest us_strategy/tests/ hk_strategy/tests/ tools/tests/test_check_moomoo_tasks.py` 338 项通过；`ruff check us_strategy hk_strategy tools/check_moomoo_tasks.py tools/liquidate_us_sim_positions.py` 通过；US/HK 正式回测报告已生成并留档 |
-
-## v1.6.0 变更摘要
-
-本版本聚焦 US/HK 双市场自动化闭环、港股模拟交易调度、盘中飞书提醒、SQLite 研究源和基准数据完善。实盘仍保持 `TRADE_ENV=REAL` + `ALLOW_REAL_TRADING=yes` + `TRADE_PASSWORD` 三重门禁，不自动启动实盘。
-
-| 方向 | 变更 |
-|---|---|
-| 模拟交易 | 新增 US/HK 显式模拟盘启动器与计划任务，固定 `TRADE_ENV=SIMULATE`，清理实盘解锁变量；港股任务 `MoomooHKSimTrade` 每周一至周五 09:15 启动 |
-| 盘中提醒 | US/HK `AlertManager` 支持飞书 `interactive` 卡片；模拟启动器内置 `FEISHU_CHAT_ID`，买卖/失败/熔断事件可推送群提醒 |
-| 信号测试 | `MAX_POSITIONS<=0` 统一表示不限制同时持仓；模拟启动器用于买卖信号测试时设置为 `0` |
-| 港股基准 | `HK.800000` 加入港股观察列表并补齐 2024 至今历史数据；默认列入 `TRADE_EXCLUDED_SYMBOLS`，只作基准/观察，不进入下单 universe |
-| 研究数据源 | `research.signal_lab` / `research.run_backtest_report` 支持 `--source sqlite --sqlite-db ...`，可直接使用本地历史库做 IC、walk-forward 和正式回测报告 |
-| 自动化核验 | `tools.check_moomoo_tasks` 覆盖 9 个 Windows 计划任务；修正 `MoomooForwardCollect` 为 16:00 北京触发，匹配脚本与 README |
-| 数据健康 | `daily_moomoo_watchlist_backfill` 支持 US/HK watchlist 与 proxy watchlist 合并回填，保留 API 错误证据 |
-| 验证 | 全量 `pytest`、`ruff check`、只读 AST 语法扫描、PowerShell 语法检查和计划任务严格回读通过 |
-
-## 数据持久化
-
-策略状态 SQLite（默认 `us_strategy/positions.db` / `hk_strategy/positions.db`，已 gitignore）：
-
-| 表 | 用途 |
-|---|---|
-| `positions` | 持仓恢复（含数量、加权成本）|
-| `signal_log` | 前向信号日志：`ts / code / last_price / scores(JSON) / market_session` |
-| `ic_history` | 每日因子 IC：`date / factor / horizon_min / ic / n` |
-
-行情与微观结构 SQLite（默认 `us_strategy/history_data.db`，已 gitignore）：
-
-| 表 | 用途 |
-|---|---|
-| `history_kline` / `market_snapshot` | 日线/分钟线与盘后快照回填 |
-| `hk_market_status_snapshots` | 港股 `dark_status` / `sec_status` 盘后状态快照 |
-| `realtime_ticks` / `realtime_quote_snapshots` | 盘中逐笔成交与低频实时快照 |
-| `order_book_snapshots` / `order_book_levels` / `order_book_metrics` | L2 多档盘口快照、档位明细与盘口指标 |
-| `broker_queue_snapshots` / `broker_queue_levels` / `broker_queue_metrics` | 港股经纪队列快照、档位明细与压力指标 |
-| `dark_pool_proxy_events` / `dark_pool_proxy_metrics` | 基于 moomoo 可见逐笔的大额成交代理信号 |
-| `l2_imbalance_signals` / `microstructure_alerts` | L2 imbalance 监控信号与告警 |
-| `microstructure_daily_features` | 盘中微观结构日级聚合，供后续 IC 校准 |
-| `backfill_runs` / `tick_runs` | 历史回填与盘中采集审计记录 |
-
-## 测试
-
-```bash
-pytest us_strategy/tests/ -q            # 美股纯逻辑单测，无需 OpenD
-pytest hk_strategy/tests/ -q            # 港股纯逻辑单测，无需 OpenD
-pytest tools/tests/ -q                  # 数据回填和实时落库工具单测
-pytest research/tests/ -q               # 研究、IC 门禁与回测报告单测
-pytest us_strategy/tests hk_strategy/tests tools/tests -q
-pytest --cov=us_strategy --cov-report=term-missing
-pytest --cov=hk_strategy --cov-report=term-missing
-```
-
-实盘/回测**同源因子引擎**，单测覆盖因子评分、决策逻辑、回测指标、日历/持仓、数据质量、IC 体检等。
-
-## 信号研究 CLI
-
-研究入口只做因子校准、walk-forward、参数搜索和报告输出，不修改实盘配置、权重、watchlist 或数据库。
-
-```bash
-python -m research.signal_lab --market us --codes US.AAPL,US.MSFT --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward
-python -m research.signal_lab --market us --codes US.AAPL,US.MSFT --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward --source sqlite --sqlite-db us_strategy/history_data.db
-python -m research.signal_lab --market hk --codes HK.00700,HK.09988 --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward
+```powershell
 python -m research.run_backtest_report --market us --codes US.AAPL,US.MSFT --start 2024-01-01 --end 2024-03-31 --source sqlite --sqlite-db us_strategy/history_data.db
 ```
 
-默认缓存目录为 `data/research_cache`。`signal_lab` 默认输出到 `report/outputs/signal_research`；`run_backtest_report` 默认输出到 `report/outputs/backtest_report`。可选研究步骤包括 `ic`、`walkforward`、`optuna`、`quantstats`、`vectorbt`；`--source sqlite` 直接读取本地历史库，`--refresh-cache` 才会强制重新从 OpenD 拉取数据。IC 输出包含 pooled IC、日度 mean IC/IR、分位收益和 gate 状态。
+Signal research CLI:
 
-## 关键约定
+```powershell
+python -m research.signal_lab --market us --codes US.AAPL,US.MSFT --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward
+python -m research.signal_lab --market hk --codes HK.00700,HK.09988 --start 2025-01-01 --end 2025-12-31 --steps ic,walkforward
+```
 
-- **股票代码**：`MARKET.CODE`；美股统一 `US.` 前缀，港股统一 `HK.` 前缀且 5 位补零
-- **返回值**：所有 API 返回 `(ret_code, data)`，须先判 `ret_code == RET_OK`
-- **评分**：0–100 风险分，有效因子 IC 显著为负
-- **稳健默认**：新因子默认关闭、权重 0，须 IC 校准后启用；限价执行默认开启
-- **仓位限制**：`MAX_POSITIONS<=0` 表示不限制同时持仓；美股模拟启动器当前设置 `MAX_POSITIONS=8`，港股模拟启动器当前设置 `MAX_POSITIONS=13`
-- **模拟仓位参数**：美股模拟账户按 `POSITION_RATIO=0.06`、`ENTRY_TRANCHES=2`、`ORDER_LOTS_PER_TRADE=0` 分批建仓，单批约为净值 3%；港股模拟账户因已接近满仓，启动器设置 `POSITION_RATIO=0`、`ORDER_LOTS_PER_TRADE=0`，暂停新增买入，只保留已有仓位卖出/风控处理
-- **IPO 观察池**：`us_strategy/ipo_watchlist.txt` 与 `hk_strategy/ipo_watchlist.txt` 使用 `YYYY-MM-DD<TAB>CODE<TAB>NAME<TAB>LIST_TIME`，启动时只加载当日记录；当日 IPO 使用独立 `IPO_POSITION_RATIO=0.05`、`IPO_ENTRY_TRANCHES=2`、`IPO_TAKE_PROFIT_PCT=0.12`、`IPO_STOP_LOSS_PCT=0.06`、`IPO_TRAILING_STOP_PCT=0.08`
-- **盘中提醒**：美股/港股模拟启动器已配置 `FEISHU_CHAT_ID`，买卖/失败/熔断提醒通过 `lark-cli` 发送飞书群卡片；IPO 只发送发现、首次可分析、买卖/风控和关键阻断事件，避免轮询 HOLD 刷屏
-- **实盘解锁**：实盘交易前必须 `trade_ctx.unlock_trade(password)`，且 `ALLOW_REAL_TRADING=yes`
-- **数据可得性**：`get_capital_distribution`、`get_broker_queue` 在不同市场可用性不同，上线前按目标市场先跑 `probe`
+Optional research steps:
 
-## 自动化计划任务
+- `ic`
+- `walkforward`
+- `optuna`
+- `quantstats`
+- `vectorbt`
 
-Windows 任务计划程序（不在仓库，启动器在 `us_strategy/*.ps1` / `hk_strategy/*.ps1`）：
+Default research outputs:
 
-| 任务 | 触发 | 作用 |
-|---|---|---|
-| `MoomooForwardCollect` | 每周一~五 16:00 北京（覆盖美股 PRE/AFTER）| 盘前/盘后只读前向观察，写 `signal_log.market_session`，不下单 |
-| `MoomooICReport` | 每周二~六 06:30 北京（收盘后）| IC 累计体检，写 `ic_history`（只读，无需 OpenD）|
-| `MoomooHKForwardCollect` | 每周一~五 09:15 北京（HKT，含午休跳过）| 港股盘中前向采集（需 OpenD）|
-| `MoomooHKICReport` | 每周一~五 16:30 北京（HK 收盘后）| 港股 IC 累计体检（只读，无需 OpenD）|
-| `MoomooUSDailyWatchlistBackfill` | 每日 06:30 北京（按市场交易日跳过）| US/HK watchlist 盘后历史行情与快照回填，US 侧同时合并 `us_strategy/proxy_watchlist.txt` |
-| `MoomooUSTickCollect` | 每周一~五 21:00 北京（美股盘前启动）| 美股盘中 TICKER、quote snapshot、L2 order book、imbalance、dark-pool proxy 与日级微观结构落库 |
-| `MoomooUSSimTrade` | 每周一~五 21:15 北京（美股盘前启动）| 美股策略模拟账户交易，固定 `TRADE_ENV=SIMULATE`，不设置实盘解锁变量 |
-| `MoomooHKTickCollect` | 每周一~五 09:15 北京（港股盘前启动）| 港股盘中 TICKER、quote snapshot、L2 order book、broker queue、imbalance、dark-pool proxy 与日级微观结构落库 |
-| `MoomooHKSimTrade` | 每周一~五 09:15 北京（港股盘前启动）| 港股策略模拟账户交易，固定 `TRADE_ENV=SIMULATE`，不设置实盘解锁变量 |
+| CLI | Default output directory |
+| --- | --- |
+| `research.signal_lab` | `report/outputs/signal_research` |
+| `research.run_backtest_report` | `report/outputs/backtest_report` |
 
-任务和数据健康只读核验：
+`report/outputs/` is ignored by Git.
 
-```bash
-python -m tools.check_moomoo_tasks
-python -m tools.check_moomoo_data_health --db us_strategy/history_data.db --markets US,HK
+## Data Persistence
+
+Strategy SQLite databases are local runtime state and are ignored by Git:
+
+| Default DB | Market |
+| --- | --- |
+| `us_strategy/positions.db` | US |
+| `hk_strategy/positions.db` | HK |
+
+Key strategy tables:
+
+| Table | Purpose |
+| --- | --- |
+| `positions` | Position recovery with quantity, weighted cost, and origin |
+| `signal_log` | Forward signal log: timestamp, code, price, score JSON, market session |
+| `ic_history` | Daily factor IC: date, factor, horizon, IC, sample size |
+
+Historical market and microstructure data is usually stored in `us_strategy/history_data.db`:
+
+| Table family | Purpose |
+| --- | --- |
+| `history_kline`, `market_snapshot` | Historical candles and after-hours snapshots |
+| `hk_market_status_snapshots` | HK `dark_status` and `sec_status` snapshots |
+| `realtime_ticks`, `realtime_quote_snapshots` | Intraday tick and quote snapshots |
+| `order_book_snapshots`, `order_book_levels`, `order_book_metrics` | L2 order book data |
+| `broker_queue_snapshots`, `broker_queue_levels`, `broker_queue_metrics` | HK broker queue data |
+| `dark_pool_proxy_events`, `dark_pool_proxy_metrics` | Large visible-trade proxy events |
+| `l2_imbalance_signals`, `microstructure_alerts` | Imbalance signals and alerts |
+| `microstructure_daily_features` | Daily aggregated microstructure features |
+| `backfill_runs`, `tick_runs` | Collection audit records |
+
+## Data Collection and Health Checks
+
+Historical backfill:
+
+```powershell
+python -m tools.daily_moomoo_watchlist_backfill --markets US,HK --db us_strategy/history_data.db
+```
+
+Realtime tick collection:
+
+```powershell
+python -m tools.collect_moomoo_ticks --codes US.AAPL,HK.00700 --markets US,HK --duration-seconds 60 --db us_strategy/history_data.db
+```
+
+Microstructure features:
+
+```powershell
 python -m tools.microstructure_features --db us_strategy/history_data.db --codes US.AAPL,HK.00700
 ```
 
-## 港股版 `hk_strategy/`
+Read-only health checks:
 
-`hk_strategy/` 是 `us_strategy/` 的港股（HKEX）平行实现，复用同一套因子/决策/执行/回测/校准引擎，仅做市场特化：
-
-| 维度 | 美股 `us_strategy` | 港股 `hk_strategy` |
-|---|---|---|
-| 代码前缀 | `US.`（如 `US.AAPL`）| `HK.`（5 位补零，如 `HK.00700`）|
-| 时区 | America/New_York（夏令时）| Asia/Hong_Kong（无夏令时）|
-| 交易时段 | 09:30–16:00 连续 | 09:30–12:00 + 午休 + 13:00–16:00 |
-| 交易日历 | NYSE（规则可算）| HKEX（`request_trading_days` API 优先 + 硬编码兜底）|
-| PDT | `min_hold_days=1` | 无 PDT，`min_hold_days=0` |
-| 成本模型 | 每股佣金 | 成交额% + 印花税 + 交易所费 |
-| 基准 | `US.SPY` | `HK.800000`（恒指）|
-| 板手 | 1 股 | 一手 N 股（自动取 `lot_size`，已支持）|
-| 独立 DB | `us_strategy/positions.db` | `hk_strategy/positions.db` |
-
-```bash
-python -m hk_strategy.probe HK.00700 HK.09988   # 数据可得性探针（需 OpenD）
-python -m hk_strategy.main                        # 港股策略（自动加载 watchlist.txt + IPO 扫描）
-pytest hk_strategy/tests/ -q                       # 港股单测（无需 OpenD）
+```powershell
+python -m tools.check_moomoo_data_health --db us_strategy/history_data.db --markets US,HK
+python -m tools.check_moomoo_tasks --root D:\moomoo-quant --json --strict
 ```
 
-> ⚠️ HKEX 硬编码假日表（`market_calendar.py`，2025–2027）为人工录入、需逐年核对官方历；生产以 API 刷新为准。扩展因子须在港股样本上**重新** IC 校准，不沿用美股结论。
+`tools.check_moomoo_tasks` validates Windows Task Scheduler metadata without modifying tasks.
 
-## 风险提示
+## Windows Scheduled Tasks
 
-- 本项目为量化策略研究/开发框架，**不构成投资建议**。
-- 实盘交易有资金损失风险；上线前务必在模拟环境（`TRADE_ENV=SIMULATE`）充分验证。
-- 扩展因子在 IC 校准达标前权重为 0，等权探索分仅供观察，**不可直接据以交易**。
+Scheduled tasks are not part of the Git repository, but the PowerShell launchers are.
 
----
+| Task | Trigger | Purpose |
+| --- | --- | --- |
+| `MoomooForwardCollect` | Mon-Fri 16:00 Beijing | US forward signal collection across PRE/AFTER sessions |
+| `MoomooICReport` | Tue-Sat 06:30 Beijing | US IC report after US close |
+| `MoomooHKForwardCollect` | Mon-Fri 09:15 Beijing | HK forward signal collection |
+| `MoomooHKICReport` | Mon-Fri 16:30 Beijing | HK IC report after HK close |
+| `MoomooUSDailyWatchlistBackfill` | Daily 06:30 Beijing | US/HK watchlist historical backfill |
+| `MoomooUSTickCollect` | Mon-Fri 21:00 Beijing | US intraday tick, quote, order-book, imbalance collection |
+| `MoomooUSSimTrade` | Mon-Fri 21:15 Beijing | US simulated strategy runtime |
+| `MoomooHKTickCollect` | Mon-Fri 09:15 Beijing | HK intraday tick, quote, order-book, broker-queue collection |
+| `MoomooHKSimTrade` | Mon-Fri 09:15 Beijing | HK simulated strategy runtime |
 
-> 更多设计细节见 [`CLAUDE.md`](CLAUDE.md)（开发指引）与 [`us_strategy/REVIEW.md`](us_strategy/REVIEW.md)（升级记录）。
+PowerShell scripts are launchers only. Complex JSON, report rendering, Feishu/Lark payloads, data
+parsing, and validation should live in Python CLIs.
+
+## Feishu / Lark Alerts
+
+Alerting is optional and environment-driven:
+
+| Variable | Purpose |
+| --- | --- |
+| `FEISHU_CHAT_ID` | Target Feishu/Lark chat ID |
+| `LARK_CLI` | Path or command name for `lark-cli` |
+| `ALERT_EMAIL` | Email alert target |
+| `TELEGRAM_TOKEN` | Telegram bot token |
+| `TELEGRAM_CHAT_ID` | Telegram chat ID |
+
+For long reports, use the established pattern:
+
+```text
+full Markdown report -> Feishu cloud document
+summary -> interactive card in group chat
+online readback -> verify message_id, card title, key fields, and document URL
+```
+
+Do not send long Markdown reports directly as chat text; that path is prone to truncation in
+Windows PowerShell and CLI quoting contexts.
+
+## Environment Variables
+
+Most settings are optional and have defaults.
+
+| Category | Variables |
+| --- | --- |
+| OpenD | `OPEND_HOST`, `OPEND_PORT` |
+| Trading mode | `TRADE_ENV`, `ALLOW_REAL_TRADING`, `TRADE_PASSWORD` |
+| Universe | `WATCHLIST`, `WATCHLIST_FILE`, `IPO_DAYS_WINDOW`, `IPO_WATCHLIST_FILE` |
+| HK liquidity | `MIN_DAILY_TURNOVER` |
+| Position sizing | `POSITION_RATIO`, `MAX_POSITIONS`, `ENTRY_TRANCHES`, `ORDER_LOTS_PER_TRADE`, `USE_ATR_SIZING` |
+| IPO sizing | `IPO_POSITION_RATIO`, `IPO_ENTRY_TRANCHES` |
+| Risk | `STOP_LOSS_PCT`, `TRAILING_STOP_PCT`, `MIN_HOLD_DAYS`, `DAILY_LOSS_LIMIT_PCT`, `CIRCUIT_BREAKER_BASELINE` |
+| IPO risk | `IPO_TAKE_PROFIT_PCT`, `IPO_STOP_LOSS_PCT`, `IPO_TRAILING_STOP_PCT` |
+| Execution | `USE_LIMIT_ORDERS`, `LIMIT_PRICE_TOLERANCE_PCT`, `TRADE_FAILURE_ALERT_COOLDOWN_S` |
+| Factor switches | `USE_RS`, `USE_ORB`, `USE_VWAP_SIGNAL`, `USE_ORDER_FLOW`, `USE_DARK_POOL_PROXY`, `USE_ORDER_BOOK_IMBALANCE`, `USE_L2_IMBALANCE_TRACKER`, `USE_INTRADAY_FLOW`, `USE_SHORT_METRICS`, `USE_OPTION_IV`, `USE_BROKER_SIGNAL`, `USE_BROKER_GATE`, `USE_HK_STATUS_SIGNAL` |
+| Alerts | `ALERT_EMAIL`, `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`, `FEISHU_CHAT_ID`, `LARK_CLI` |
+| Calibration | `MONITOR_INTERVAL_S`, `MONITOR_MAX_ROUNDS`, `IC_HORIZONS`, `IC_MIN_DAYS`, `DB_PATH` |
+
+See the docstrings at the top of `us_strategy/main.py` and `hk_strategy/main.py` for the most
+current runtime list.
+
+## Moomoo API Rate Limits
+
+Repository-level rate-limit facts live in `moomoo_rate_limits.py`. Strategy configs default to a
+conservative global token bucket of `28` requests per `30` seconds for `DataAccess`, leaving margin
+below known 30-per-30-second endpoints.
+
+| API family | Conservative rule | Notes |
+| --- | ---: | --- |
+| `get_market_snapshot` | 60 / 30s | Single call supports many symbols, subject to data package limits |
+| `request_history_kline` | 60 / 30s | First page is rate-limited; pagination behavior differs |
+| `get_capital_flow`, `get_capital_distribution` | 30 / 30s | Covered by the default 28 / 30s global bucket |
+| `get_option_expiration_date` | 60 / 30s | Pre-query for option chain |
+| `get_option_chain` | 10 / 30s | Default tooling sleeps around 3 seconds |
+| Trade queries with `refresh_cache=True` | 10 / 30s / account | Strategy defaults usually read OpenD cache |
+| `place_order` | 15 / 30s / account | Live use still requires manual review and unlock gates |
+| Subscribed quote/order-book/ticker reads | OpenD cache | Not counted as server requests, but subject to subscription quota |
+
+Unknown or low-frequency endpoints should be treated conservatively unless the official current
+documentation says otherwise.
+
+## Testing and Validation
+
+Recommended local validation:
+
+```powershell
+python -m pytest -q
+python -m ruff check .
+python -m tools.check_moomoo_tasks --root D:\moomoo-quant --json --strict
+git diff --check
+```
+
+For low-side-effect syntax validation on Windows, prefer an AST parse pass instead of commands that
+write `__pycache__` files:
+
+```powershell
+python -c "import ast, pathlib; [ast.parse(p.read_text(encoding='utf-8-sig'), filename=str(p)) for p in pathlib.Path('.').rglob('*.py') if '.venv' not in p.parts]"
+```
+
+Before changing strategy logic, validate at least:
+
+- Unit tests for the affected market package.
+- Backtest report on the affected universe.
+- Forward IC or historical IC evidence for any factor weight change.
+- No new live-trading bypass.
+- No PowerShell JSON or report-generation logic added outside Python.
+
+## Release Highlights
+
+### v1.8.0
+
+- Added independent today-IPO simulation flow for US and HK.
+- Today IPOs no longer mix into the regular watchlist.
+- Added IPO-specific position sizing, take profit, stop loss, and trailing stop profiles.
+- IPO positions persist with `origin=ipo`, so restarts keep the correct risk profile.
+- Added Feishu/Lark alerts for IPO discovery, first analyzable state, trades, risk exits, and key blocks.
+- `tools.check_moomoo_tasks` accepts running Windows Task Scheduler status values that are not errors.
+- Local validation for the release recorded full pytest, ruff, and whitespace checks, with one known historical task-state warning for `MoomooHKTickCollect`.
+
+### v1.7.0
+
+- Improved US/HK simulation execution loop and account snapshot alerts.
+- Added separate simulated-account sizing for US and HK.
+- Added fill-timeout cancellation checks.
+- Added `tools/liquidate_us_sim_positions.py` with simulation-only safeguards.
+- Extended task validation for simulation launcher parameters.
+
+### v1.6.0
+
+- Added US/HK scheduled automation loop.
+- Added HK simulated trading scheduler.
+- Added Feishu interactive-card alerting.
+- Added SQLite research source support for `research.signal_lab` and `research.run_backtest_report`.
+- Added HK benchmark support through `HK.800000`.
+- Expanded task and data-health checks.
+
+## Development Rules
+
+Repository-specific development guidance lives in `AGENTS.md`.
+
+Important project rules:
+
+- Use UTF-8 for text, Markdown, Python, configs, and generated report content.
+- PowerShell files should remain launchers; business logic belongs in Python CLIs.
+- Prefer `subprocess.run([...])` argument arrays for external CLI calls.
+- Do not hard-code API keys, passwords, chat IDs, or account credentials.
+- Do not add dependencies without an explicit reason and installation notes.
+- Do not enable live trading by default.
+- Do not treat `receipt=sent` as final alert validation; use online readback when sending Feishu/Lark messages.
+
+## Known Limitations
+
+- OpenD, market-data permission, account type, and region-specific endpoint availability determine what can actually run.
+- Some moomoo endpoints differ between US and HK markets.
+- Microstructure factors need forward collection before they can be trusted.
+- Local SQLite data and generated reports are not included in the repository.
+- No pinned lockfile is currently provided.
+- The repository currently has no open-source license file.
+
+## License
+
+No open-source license has been declared yet. Public visibility on GitHub does not automatically
+grant permission to copy, modify, redistribute, or use this project commercially.
+
+Contact the repository owner before reusing the code outside personal research.
