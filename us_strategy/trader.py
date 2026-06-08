@@ -12,6 +12,8 @@ from .data_access import DataAccess
 
 logger = logging.getLogger(__name__)
 
+_CANCEL_FAILURE_FILLED_MARKERS = ("已成交", "FILLED_ALL", "FILLED")
+
 
 @dataclass(frozen=True)
 class ExecutionQualityRecord:
@@ -49,12 +51,18 @@ class Trader:
             ft.TrdEnv.REAL if config.trd_env == "REAL" else ft.TrdEnv.SIMULATE
         )
         self._execution_quality: list[ExecutionQualityRecord] = []
+        self._last_failure_reason = ""
 
     @property
     def execution_quality_records(self) -> tuple[ExecutionQualityRecord, ...]:
         """Return execution-quality records collected since process start."""
 
         return tuple(self._execution_quality)
+
+    @property
+    def last_failure_reason(self) -> str:
+        """返回最近一次执行失败原因，用于告警展示。"""
+        return self._last_failure_reason
 
     # ── 查询 ────────────────────────────────────────────────────────────
     def _positions(self):
@@ -105,13 +113,15 @@ class Trader:
 
         - 新开仓受 max_positions 限制；max_positions <= 0 表示不限制。
         - 加仓不受 max_positions 限制。
-        - use_atr_sizing 时按 ATR 风险预算定量，否则按 position_ratio/批数。
+        - use_atr_sizing 时按 ATR 风险预算定量，否则按净值比例/批数定量。
         """
+        self._last_failure_reason = ""
         if (
             is_new_position
             and self._cfg.max_positions > 0
             and self.count_open_positions() >= self._cfg.max_positions
         ):
+            self._last_failure_reason = f"已达最大持仓数 {self._cfg.max_positions}"
             logger.warning(
                 "已达最大持仓数 %d，跳过新开仓 %s", self._cfg.max_positions, code
             )
@@ -119,19 +129,29 @@ class Trader:
 
         ret, acc_df = self._data.accinfo_query()
         if ret != ft.RET_OK or acc_df.empty:
+            self._last_failure_reason = f"账户信息查询失败: {acc_df}"
             logger.error("accinfo_query 失败: %s", acc_df)
             return False, 0.0, 0
 
-        try:
-            power = float(acc_df["power"].iloc[0])
-        except (KeyError, TypeError, ValueError, IndexError):
-            power = 0.0
+        row = acc_df.iloc[0]
+        power = _buying_power_from_account(row, self._cfg.trd_env)
         net_value = self.get_portfolio_value()
 
         qty = self._size_position(current_price, lot_size, atr, power, net_value)
         if qty <= 0:
+            self._last_failure_reason = _zero_quantity_reason(
+                current_price,
+                lot_size,
+                atr,
+                power,
+                net_value,
+                self._cfg,
+            )
             logger.warning(
-                "资金不足或仓位为零，跳过买入 %s (price=%.3f)", code, current_price
+                "%s，跳过买入 %s (price=%.3f)",
+                self._last_failure_reason,
+                code,
+                current_price,
             )
             return False, 0.0, 0
 
@@ -150,8 +170,10 @@ class Trader:
 
     def sell(self, code: str, current_price: float) -> bool:
         """清仓指定股票（marketable-limit）。"""
+        self._last_failure_reason = ""
         qty = self.get_position_qty(code)
         if qty <= 0:
+            self._last_failure_reason = "无持仓可卖"
             logger.info("无持仓可卖: %s", code)
             return False
 
@@ -177,6 +199,12 @@ class Trader:
         net_value: float,
     ) -> int:
         cfg = self._cfg
+        lot = max(1, int(lot_size or 1))
+        if cfg.order_lots_per_trade > 0:
+            qty = lot * cfg.order_lots_per_trade
+            if price <= 0 or qty * price > power:
+                return 0
+            return qty
         if cfg.use_atr_sizing and atr and atr > 0 and net_value > 0:
             sized = features.atr_position_size(
                 net_value,
@@ -191,17 +219,21 @@ class Trader:
             if price > 0:
                 qty = min(qty, int(power / price))
         else:
-            tranche_budget = power * cfg.position_ratio / cfg.entry_tranches
+            sizing_base = net_value if net_value > 0 else power
+            tranche_budget = (
+                sizing_base * cfg.position_ratio / max(1, cfg.entry_tranches)
+            )
             qty = int(math.floor(tranche_budget / price)) if price > 0 else 0
-        return (qty // lot_size) * lot_size
+            if price > 0:
+                qty = min(qty, int(power / price))
+        return (qty // lot) * lot
 
     def _limit_price(self, current_price: float, is_buy: bool) -> float:
         tol = self._cfg.limit_price_tolerance_pct
         if not self._cfg.use_limit_orders:
             return 0.0  # 0 → 市价单
-        if is_buy:
-            return round(current_price * (1 + tol), 3)
-        return round(current_price * (1 - tol), 3)
+        price = current_price * (1 + tol) if is_buy else current_price * (1 - tol)
+        return round(price, 2)
 
     def _place_and_confirm(
         self,
@@ -225,6 +257,7 @@ class Trader:
         )
         self._data.on_order_changed()
         if ret != ft.RET_OK:
+            self._last_failure_reason = f"下单接口失败: {data}"
             logger.error("下单失败 %s %s: %s", side, code, data)
             self._record_execution_quality(
                 code=code,
@@ -246,6 +279,22 @@ class Trader:
             reference_price,
             qty,
         )
+        if status.startswith("TIMEOUT:") and filled < qty:
+            cancel_status = self._cancel_order(order_id)
+            status = f"{status};{cancel_status}"
+            latest_price, latest_filled, latest_status = self._query_order_once(
+                order_id,
+                fallback_price=fill_price,
+                fallback_filled=filled,
+            )
+            if latest_filled > filled or _is_filled_status(latest_status):
+                fill_price = latest_price
+                filled = latest_filled or qty
+                status = f"{latest_status};{cancel_status}"
+            elif _cancel_failure_implies_fill(cancel_status):
+                fill_price = latest_price
+                filled = qty
+                status = f"FILLED_ASSUMED_AFTER_CANCEL_FAILED;{cancel_status}"
         self._record_execution_quality(
             code=code,
             side=str(side),
@@ -258,7 +307,48 @@ class Trader:
             order_id=str(order_id or ""),
             status=status,
         )
+        if filled <= 0:
+            self._last_failure_reason = f"订单未成交或超时: status={status}, order_id={order_id}"
         return (filled > 0), fill_price, filled
+
+    def _cancel_order(self, order_id: object) -> str:
+        """撤销超时未全成订单，返回用于执行质量记录的状态片段。"""
+        if not order_id:
+            return "CANCEL_SKIPPED:MISSING_ORDER_ID"
+        ret, data = self._ctx.modify_order(
+            ft.ModifyOrderOp.CANCEL,
+            order_id=order_id,
+            qty=0,
+            price=0,
+            trd_env=self._trd_env,
+        )
+        self._data.on_order_changed()
+        if ret == ft.RET_OK:
+            logger.info("订单 %s 超时后已发送撤单", order_id)
+            return "CANCEL_SENT"
+        logger.error("订单 %s 超时撤单失败: %s", order_id, data)
+        return f"CANCEL_FAILED:{data}"
+
+    def _query_order_once(
+        self,
+        order_id: object,
+        fallback_price: float,
+        fallback_filled: int,
+    ) -> tuple[float, int, str]:
+        """读取一次订单状态，用于撤单失败后的成交竞态复核。"""
+        ret, df = self._ctx.order_list_query(
+            order_id=order_id,
+            trd_env=self._trd_env,
+            refresh_cache=True,
+        )
+        if ret != ft.RET_OK or df.empty:
+            return fallback_price, fallback_filled, "ORDER_QUERY_FAILED"
+        row = df.iloc[0]
+        status = str(row.get("order_status", "")) or "UNKNOWN"
+        filled = int(_extract(df, "dealt_qty", fallback_filled) or fallback_filled)
+        avg = float(_extract(df, "dealt_avg_price", 0) or 0)
+        price = avg if avg > 0 else fallback_price
+        return price, filled, status
 
     def _poll_fill(
         self, order_id, fallback_price: float, want_qty: int
@@ -358,3 +448,103 @@ def _slippage_bps(
     if "SELL" in side_upper:
         return (reference_price - fill_price) / reference_price * 10_000.0
     return None
+
+
+def _is_filled_status(status: object) -> bool:
+    """判断订单状态是否表示全部成交。"""
+    return "FILLED_ALL" in str(status).upper()
+
+
+def _cancel_failure_implies_fill(cancel_status: object) -> bool:
+    """moomoo 撤单失败文案明确表示已成交时，按成交竞态处理。"""
+    text = str(cancel_status)
+    upper = text.upper()
+    return any(marker in text or marker in upper for marker in _CANCEL_FAILURE_FILLED_MARKERS)
+
+
+def _positive_float(value: object) -> float:
+    """返回正数浮点值；空值、N/A、非数值均按 0 处理。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return result if math.isfinite(result) and result > 0 else 0.0
+
+
+def _zero_quantity_reason(
+    price: float,
+    lot_size: int,
+    atr: float | None,
+    power: float,
+    net_value: float,
+    cfg: StrategyConfig,
+) -> str:
+    """解释仓位计算为 0 的原因。"""
+    if price <= 0:
+        return f"价格无效：price={price:.3f}"
+    lot = max(1, int(lot_size or 1))
+    min_lot_cash = price * lot
+    if cfg.order_lots_per_trade > 0:
+        target_qty = lot * cfg.order_lots_per_trade
+        target_cash = price * target_qty
+        return (
+            f"固定{cfg.order_lots_per_trade}手下单资金不足："
+            f"计划数量={target_qty}，预计金额={target_cash:.2f}，"
+            f"可用资金={power:.2f}，lot_size={lot}"
+        )
+    if power < min_lot_cash:
+        return (
+            f"可用资金不足：可用资金={power:.2f}，"
+            f"最低一手约={min_lot_cash:.2f}，lot_size={lot}"
+        )
+    if cfg.use_atr_sizing:
+        return (
+            f"ATR仓位为0：可用资金={power:.2f}，净值={net_value:.2f}，"
+            f"ATR={atr or 0:.3f}，最低一手约={min_lot_cash:.2f}，lot_size={lot}"
+        )
+    sizing_base = net_value if net_value > 0 else power
+    tranche_budget = sizing_base * cfg.position_ratio / max(1, cfg.entry_tranches)
+    if tranche_budget < min_lot_cash:
+        return (
+            f"单批预算不足：单批预算={tranche_budget:.2f}，"
+            f"最低一手约={min_lot_cash:.2f}，"
+            f"净值={net_value:.2f}，可用资金={power:.2f}，lot_size={lot}"
+        )
+    return (
+        f"整手约束导致数量为0：可用资金={power:.2f}，"
+        f"净值={net_value:.2f}，单批预算={tranche_budget:.2f}，"
+        f"最低一手约={min_lot_cash:.2f}，lot_size={lot}"
+    )
+
+
+def _account_field(row: object, field: str) -> object:
+    """兼容 pandas Series 的字段读取。"""
+    getter = getattr(row, "get", None)
+    if not callable(getter):
+        return None
+    return getter(field, None)
+
+
+def _buying_power_from_account(row: object, trd_env: str) -> float:
+    """读取购买力；模拟盘 power 为 0 时回退现金字段，实盘不回退。"""
+    power = _positive_float(_account_field(row, "power"))
+    if power > 0 or trd_env == "REAL":
+        return power
+
+    for field in (
+        "available_funds",
+        "cash",
+        "net_cash_power",
+        "net_cash_value",
+        "total_assets",
+        "net_assets",
+    ):
+        fallback = _positive_float(_account_field(row, field))
+        if fallback > 0:
+            logger.warning(
+                "账户 power=0，模拟盘使用 %s=%.2f 估算购买力",
+                field,
+                fallback,
+            )
+            return fallback
+    return 0.0

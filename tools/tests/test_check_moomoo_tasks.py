@@ -44,6 +44,7 @@ def test_validate_task_records_accepts_forward_collect_1600(tmp_path: Path) -> N
             ),
             "TriggerType": "MSFT_TaskWeeklyTrigger",
             "StartBoundary": "2026-06-08T16:00:00+08:00",
+            "ExecutionTimeLimit": "PT17H",
             "LastTaskResult": 0,
         }
     ]
@@ -53,6 +54,7 @@ def test_validate_task_records_accepts_forward_collect_1600(tmp_path: Path) -> N
 
     assert forward.status == "ok"
     assert forward.messages == ()
+    assert forward.actual_execution_time_limit == "PT17H"
 
 
 def test_validate_task_records_flags_missing_hidden_argument(tmp_path: Path) -> None:

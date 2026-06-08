@@ -15,6 +15,7 @@ EXPECTED_TASKS: tuple[dict[str, Any], ...] = (
         "script_path": "us_strategy\\forward_collect.ps1",
         "trigger_type": "weekly",
         "time": "16:00",
+        "execution_time_limit": "PT17H",
     },
     {
         "task_name": "MoomooICReport",
@@ -78,6 +79,8 @@ class TaskCheck:
     expected_time: str
     actual_time: str | None
     last_task_result: int | None
+    expected_execution_time_limit: str | None
+    actual_execution_time_limit: str | None
     messages: tuple[str, ...]
 
 
@@ -94,6 +97,7 @@ def validate_task_records(
         script_path = str(expected["script_path"])
         trigger_type = str(expected["trigger_type"])
         expected_time = str(expected["time"])
+        expected_limit = expected.get("execution_time_limit")
         record = by_name.get(name)
         messages: list[str] = []
         if record is None or not record.get("Exists", True):
@@ -106,6 +110,10 @@ def validate_task_records(
                     expected_time=expected_time,
                     actual_time=None,
                     last_task_result=None,
+                    expected_execution_time_limit=(
+                        str(expected_limit) if expected_limit else None
+                    ),
+                    actual_execution_time_limit=None,
                     messages=("scheduled task is missing",),
                 )
             )
@@ -115,6 +123,7 @@ def validate_task_records(
         actual_time = _time_from_boundary(record.get("StartBoundary"))
         actual_trigger = str(record.get("TriggerType") or "").lower()
         last_result = _int_or_none(record.get("LastTaskResult"))
+        actual_limit = str(record.get("ExecutionTimeLimit") or "") or None
         absolute_script = root / script_path
 
         if script_path.lower() not in arguments.lower():
@@ -127,6 +136,10 @@ def validate_task_records(
             messages.append(f"trigger type mismatch: {actual_trigger or 'unknown'}")
         if actual_time != expected_time:
             messages.append(f"time mismatch: {actual_time or 'unknown'}")
+        if expected_limit and actual_limit != str(expected_limit):
+            messages.append(
+                f"execution time limit mismatch: {actual_limit or 'unknown'}"
+            )
         if last_result not in (None, 0, 267011, 267014):
             messages.append(f"last task result is abnormal: {last_result}")
 
@@ -139,6 +152,10 @@ def validate_task_records(
                 expected_time=expected_time,
                 actual_time=actual_time,
                 last_task_result=last_result,
+                expected_execution_time_limit=(
+                    str(expected_limit) if expected_limit else None
+                ),
+                actual_execution_time_limit=actual_limit,
                 messages=tuple(messages),
             )
         )
@@ -175,6 +192,7 @@ $rows = foreach ($name in $names) {{
         Arguments = [string]$task.Actions.Arguments
         TriggerType = [string]$trigger.CimClass.CimClassName
         StartBoundary = [string]$trigger.StartBoundary
+        ExecutionTimeLimit = [string]$task.Settings.ExecutionTimeLimit
         LastTaskResult = [int]$info.LastTaskResult
         LastRunTime = [string]$info.LastRunTime
         NextRunTime = [string]$info.NextRunTime

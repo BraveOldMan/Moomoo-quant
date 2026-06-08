@@ -15,10 +15,13 @@ from hk_strategy.config import StrategyConfig
 def test_feishu_alert_sends_interactive_card(monkeypatch) -> None:
     captured: dict[str, object] = {}
 
-    def fake_run(command, **_kwargs):
-        params_path = _arg_path(command, "--params")
-        body_path = _arg_path(command, "--data")
+    def fake_run(command, **kwargs):
+        cwd = Path(kwargs["cwd"])
+        params_path = _arg_path(command, "--params", cwd)
+        body_path = _arg_path(command, "--data", cwd)
         captured["command"] = command
+        captured["cwd"] = cwd
+        captured["cwd_exists_during_run"] = cwd.exists()
         captured["params"] = json.loads(params_path.read_text(encoding="utf-8"))
         captured["body"] = json.loads(body_path.read_text(encoding="utf-8"))
         return SimpleNamespace(
@@ -41,6 +44,7 @@ def test_feishu_alert_sends_interactive_card(monkeypatch) -> None:
     assert card["header"]["template"] == "green"
     assert "HK.00700" in card["elements"][0]["text"]["content"]
     assert captured["params"] == {"receive_id_type": "chat_id"}
+    assert captured["cwd_exists_during_run"] is True
 
 
 def test_no_feishu_chat_id_does_not_call_lark(monkeypatch) -> None:
@@ -67,7 +71,9 @@ def test_config_reads_feishu_chat_id(monkeypatch) -> None:
     assert cfg.lark_cli == "D:\\tools\\lark-cli.cmd"
 
 
-def _arg_path(command: list[str], option: str) -> Path:
+def _arg_path(command: list[str], option: str, cwd: Path) -> Path:
     raw = command[command.index(option) + 1]
     assert raw.startswith("@")
-    return Path(raw[1:])
+    path = Path(raw[1:])
+    assert not path.is_absolute()
+    return cwd / path

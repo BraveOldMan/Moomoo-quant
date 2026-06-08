@@ -84,6 +84,7 @@ class StrategyConfig:
     position_ratio: float = 0.2  # 满仓时每只股占购买力比例
     max_positions: int = 3  # 最多同时持仓股票数；<=0 表示不限制
     entry_tranches: int = 2  # 分批买入笔数（1=一次性全仓）
+    order_lots_per_trade: int = 0  # >0 时每次买入固定 N 手，覆盖仓位比例
     exit_tranches: int = 1  # 分批卖出笔数（1=一次性清仓）
 
     # ── 波动率/ATR 仓位（替代固定 position_ratio）──────────────────────
@@ -226,6 +227,7 @@ class StrategyConfig:
     limit_price_tolerance_pct: float = 0.005  # 买高/卖低容忍带 ±0.5%
     order_fill_timeout_s: float = 10.0  # 等待成交的最长秒数
     order_poll_interval_s: float = 1.0  # 轮询订单状态间隔
+    trade_failure_alert_cooldown_s: float = 300.0  # 同一标的失败提醒冷却秒数
 
     # ── 数据访问缓存 TTL（秒）─────────────────────────────────────────
     snapshot_cache_ttl_s: float = 2.0
@@ -282,6 +284,7 @@ class StrategyConfig:
             position_ratio=float(os.environ.get("POSITION_RATIO", "0.2")),
             max_positions=int(os.environ.get("MAX_POSITIONS", "3")),
             entry_tranches=int(os.environ.get("ENTRY_TRANCHES", "2")),
+            order_lots_per_trade=int(os.environ.get("ORDER_LOTS_PER_TRADE", "0")),
             use_atr_sizing=_bool("USE_ATR_SIZING", False),
             atr_risk_per_trade_pct=float(
                 os.environ.get("ATR_RISK_PER_TRADE_PCT", "0.01")
@@ -296,6 +299,11 @@ class StrategyConfig:
             use_limit_orders=_bool("USE_LIMIT_ORDERS", True),
             limit_price_tolerance_pct=float(
                 os.environ.get("LIMIT_PRICE_TOLERANCE_PCT", "0.005")
+            ),
+            order_fill_timeout_s=float(os.environ.get("ORDER_FILL_TIMEOUT_S", "10.0")),
+            order_poll_interval_s=float(os.environ.get("ORDER_POLL_INTERVAL_S", "1.0")),
+            trade_failure_alert_cooldown_s=float(
+                os.environ.get("TRADE_FAILURE_ALERT_COOLDOWN_S", "300.0")
             ),
             api_rate_limit=int(
                 os.environ.get("API_RATE_LIMIT", str(DEFAULT_DATA_ACCESS_RATE_LIMIT))

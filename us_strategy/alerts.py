@@ -96,9 +96,9 @@ class AlertManager:
                         "POST",
                         "/open-apis/im/v1/messages",
                         "--params",
-                        f"@{params_path}",
+                        f"@{params_path.name}",
                         "--data",
-                        f"@{body_path}",
+                        f"@{body_path.name}",
                     ]
                 )
                 completed = subprocess.run(
@@ -108,6 +108,7 @@ class AlertManager:
                     capture_output=True,
                     encoding="utf-8",
                     timeout=15,
+                    cwd=tmp_path,
                 )
             if completed.returncode != 0:
                 logger.error(

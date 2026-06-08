@@ -27,11 +27,13 @@
   MIN_HOLD_DAYS                    最小持仓交易日，默认 0（港股无 PDT）
   DAILY_LOSS_LIMIT_PCT / CIRCUIT_BREAKER_BASELINE   组合熔断
   USE_LIMIT_ORDERS / LIMIT_PRICE_TOLERANCE_PCT      限价执行
+  TRADE_FAILURE_ALERT_COOLDOWN_S                    买卖失败提醒冷却秒数
   USE_RS / USE_ORB / USE_VWAP_SIGNAL / USE_BROKER_SIGNAL   因子开关
   ALERT_EMAIL / TELEGRAM_TOKEN / TELEGRAM_CHAT_ID   告警
 """
 
 import logging
+import math
 import queue
 import threading
 import time
@@ -66,6 +68,9 @@ logger = logging.getLogger(__name__)
 
 _IPO_REFRESH_INTERVAL = 300  # 每 5 分钟刷新一次 IPO 列表
 _SHUTDOWN = object()  # 队列哨兵
+_DISPLAY_NAME_FIELDS = ("name", "stock_name", "security_name", "short_name")
+_EMPTY_DISPLAY_NAMES = {"", "nan", "none", "n/a", "na", "--"}
+_BUY_FAILURE_ALERT_SUPPRESS_MARKERS = ("资金不足", "预算不足")
 
 
 def _hhmm(s: str) -> _time:
@@ -102,6 +107,44 @@ def _tradable_watchlist(cfg: StrategyConfig) -> tuple[str, ...]:
 
     excluded = set(cfg.trade_excluded_symbols)
     return tuple(code for code in cfg.watchlist if code not in excluded)
+
+
+class _FailureAlertGate:
+    """按事件和标的压制重复失败提醒，不影响信号记录。"""
+
+    def __init__(self, cooldown_s: float) -> None:
+        self._cooldown_s = max(0.0, cooldown_s)
+        self._last_sent: dict[tuple[str, str], float] = {}
+
+    def should_send(
+        self,
+        event: str,
+        code: str,
+        now: float | None = None,
+    ) -> bool:
+        """返回当前失败事件是否应发送提醒。时间口径为 monotonic 秒。"""
+        if self._cooldown_s <= 0:
+            return True
+        current = time.monotonic() if now is None else now
+        key = (event, code)
+        last = self._last_sent.get(key)
+        if last is not None and current - last < self._cooldown_s:
+            return False
+        self._last_sent[key] = current
+        return True
+
+
+def _should_ignore_unheld_sell(
+    has_strategy_position: bool,
+    broker_qty: int,
+) -> bool:
+    """无本地持仓且券商仓位为 0 时，卖出信号只记录不执行。"""
+    return not has_strategy_position and broker_qty <= 0
+
+
+def _should_suppress_buy_failure_alert(reason: str) -> bool:
+    """资金/预算不足属于预期阻断，只写日志，不反复打扰飞书群。"""
+    return any(marker in reason for marker in _BUY_FAILURE_ALERT_SUPPRESS_MARKERS)
 
 
 def _fetch_recent_ipos(
@@ -148,6 +191,201 @@ def _fetch_recent_ipos(
     return result
 
 
+def _snapshot_display_name(row: object, code: str) -> str:
+    """从 moomoo 快照行提取提醒展示名，取不到名称时回退为代码。"""
+    getter = getattr(row, "get", None)
+    if not callable(getter):
+        return code
+    for field in _DISPLAY_NAME_FIELDS:
+        raw = getter(field, None)
+        if raw is None:
+            continue
+        name = str(raw).strip()
+        if name.lower() not in _EMPTY_DISPLAY_NAMES and name != code:
+            return f"{name}（{code}）"
+    return code
+
+
+def _get_symbol_display(data: DataAccess, code: str) -> str:
+    """从行情快照获取提醒展示名，失败时保持原始代码。"""
+    ret, df = data.get_market_snapshot(code)
+    if ret != ft.RET_OK or df.empty:
+        return code
+    return _snapshot_display_name(df.iloc[0], code)
+
+
+def _planned_buy_text(lot_size: int, cfg: StrategyConfig) -> str:
+    """返回买入计划数量说明。"""
+    lot = max(1, int(lot_size or 1))
+    if cfg.order_lots_per_trade > 0:
+        qty = lot * cfg.order_lots_per_trade
+        return f"{cfg.order_lots_per_trade}手，qty={qty}，lot_size={lot}"
+    return f"按仓位算法计算，lot_size={lot}"
+
+
+def _alert_with_account_snapshot(message: str, account_snapshot: str = "") -> str:
+    """把账户快照追加到飞书信号正文底部。"""
+    if not account_snapshot:
+        return message
+    return f"{message}\n\n{account_snapshot}"
+
+
+def _buy_alert_message(
+    display: str,
+    signal_price: float,
+    lot_size: int,
+    cfg: StrategyConfig,
+    decision_reason: str,
+    result: str,
+    detail: str,
+    account_snapshot: str = "",
+) -> str:
+    """构造买入飞书提醒正文。"""
+    message = (
+        f"标的：{display}\n"
+        f"信号：BUY\n"
+        f"信号理由：{decision_reason}\n"
+        f"信号价：{signal_price:.3f}\n"
+        f"计划下单：{_planned_buy_text(lot_size, cfg)}\n"
+        f"执行结果：{result}\n"
+        f"{detail}"
+    )
+    return _alert_with_account_snapshot(message, account_snapshot)
+
+
+def _sell_alert_message(
+    display: str,
+    signal_price: float,
+    decision_reason: str,
+    result: str,
+    detail: str,
+    account_snapshot: str = "",
+) -> str:
+    """构造卖出飞书提醒正文。"""
+    message = (
+        f"标的：{display}\n"
+        f"信号：SELL\n"
+        f"信号理由：{decision_reason}\n"
+        f"触发价：{signal_price:.3f}\n"
+        "计划下单：清仓当前持仓\n"
+        f"执行结果：{result}\n"
+        f"{detail}"
+    )
+    return _alert_with_account_snapshot(message, account_snapshot)
+
+
+def _safe_number(value: object) -> float | None:
+    """把 moomoo 返回值转成有限浮点数，N/A、空值和非数字返回 None。"""
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _row_number(row: object, fields: tuple[str, ...]) -> float | None:
+    """按字段顺序读取首个有效数值。"""
+    getter = getattr(row, "get", None)
+    if not callable(getter):
+        return None
+    for field in fields:
+        value = _safe_number(getter(field, None))
+        if value is not None:
+            return value
+    return None
+
+
+def _sum_frame_number(frame: object, fields: tuple[str, ...]) -> float | None:
+    """聚合 DataFrame 中首个可用字段的数值列。"""
+    empty = getattr(frame, "empty", True)
+    if empty:
+        return None
+    columns = getattr(frame, "columns", ())
+    for field in fields:
+        if field not in columns:
+            continue
+        total = 0.0
+        found = False
+        for value in frame[field]:
+            number = _safe_number(value)
+            if number is None:
+                continue
+            total += number
+            found = True
+        if found:
+            return total
+    return None
+
+
+def _format_money(value: float | None) -> str:
+    """格式化普通金额。"""
+    if value is None:
+        return "--"
+    return f"{value:,.2f}"
+
+
+def _format_signed_money(value: float | None) -> str:
+    """格式化带正负号的盈亏金额。"""
+    if value is None:
+        return "--"
+    return f"{value:+,.2f}"
+
+
+def _format_signed_pct(value: float | None) -> str:
+    """格式化带正负号的百分比。"""
+    if value is None:
+        return "--"
+    return f"{value:+.2f}%"
+
+
+def _account_snapshot_text(data: DataAccess) -> str:
+    """生成飞书信号底部账户快照，金额口径为 moomoo HK 模拟账户 HKD。"""
+    ret, acc = data.accinfo_query()
+    if ret != ft.RET_OK or acc.empty:
+        logger.warning("账户快照查询失败: %s", acc)
+        return ""
+
+    row = acc.iloc[0]
+    net_assets = _row_number(row, ("net_assets", "total_assets", "net_cash_value"))
+    market_value = _row_number(row, ("market_val", "securities_assets"))
+    buying_power = _row_number(row, ("power",))
+    maintenance_margin = _row_number(row, ("maintenance_margin",))
+    cash = _row_number(row, ("cash", "hk_cash", "available_funds"))
+    remaining_liquidity = (
+        net_assets - maintenance_margin
+        if net_assets is not None and maintenance_margin is not None
+        else None
+    )
+
+    position_ret, positions = data.position_list_query()
+    if position_ret == ft.RET_OK:
+        today_pl = _sum_frame_number(positions, ("today_pl_val", "td_pl_val"))
+        holding_pl = _sum_frame_number(positions, ("pl_val", "unrealized_pl"))
+    else:
+        logger.warning("账户快照持仓盈亏查询失败: %s", positions)
+        today_pl = None
+        holding_pl = None
+
+    today_pl_pct = (
+        today_pl / net_assets * 100.0
+        if today_pl is not None and net_assets not in (None, 0.0)
+        else None
+    )
+
+    items = (
+        f"资产净值 {_format_money(net_assets)} 港元",
+        f"今日盈亏 {_format_signed_money(today_pl)}",
+        f"今日盈亏比例 {_format_signed_pct(today_pl_pct)}",
+        f"持仓盈亏 {_format_signed_money(holding_pl)}",
+        f"持仓市值 {_format_money(market_value)}",
+        f"最大购买力 {_format_money(buying_power)}",
+        f"维持保证金 {_format_money(maintenance_margin)}",
+        f"现金 {_format_money(cash)}",
+        f"剩余流动性 {_format_money(remaining_liquidity)}",
+    )
+    return "账户快照：" + " | ".join(items)
+
+
 def _get_snapshot(data: DataAccess, code: str) -> tuple[float | None, int]:
     ret, df = data.get_market_snapshot(code)
     if ret != ft.RET_OK or df.empty:
@@ -164,6 +402,15 @@ def _get_snapshot(data: DataAccess, code: str) -> tuple[float | None, int]:
     return price, lot_size
 
 
+def _open_trade_context(cfg: StrategyConfig) -> ft.OpenSecTradeContext:
+    """创建绑定港股证券账户的交易上下文，避免 NONE 选中其他市场模拟账户。"""
+    return ft.OpenSecTradeContext(
+        filter_trdmarket=ft.TrdMarket.HK,
+        host=cfg.host,
+        port=cfg.port,
+    )
+
+
 def run() -> None:
     cfg = StrategyConfig.from_env()
     if cfg.trd_env == "REAL":
@@ -176,9 +423,7 @@ def run() -> None:
             raise RuntimeError("实盘模式必须设置 TRADE_PASSWORD 环境变量")
 
     quote_ctx = ft.OpenQuoteContext(host=cfg.host, port=cfg.port)
-    trade_ctx = ft.OpenSecTradeContext(
-        filter_trdmarket=ft.TrdMarket.NONE, host=cfg.host, port=cfg.port
-    )
+    trade_ctx = _open_trade_context(cfg)
 
     # 用 API 刷新 HKEX 交易日历（覆盖今明两年）；失败则静默回退硬编码表。
     _yr = market_date(cfg.market_timezone).year
@@ -255,6 +500,7 @@ def run() -> None:
 
     events: queue.Queue = queue.Queue()
     baseline_set_date: dict[str, date] = {}
+    failure_alert_gate = _FailureAlertGate(cfg.trade_failure_alert_cooldown_s)
 
     def set_circuit_breaker_baseline(today: date, portfolio_value: float) -> None:
         """Inject the configured daily circuit-breaker baseline once per day."""
@@ -279,6 +525,13 @@ def run() -> None:
             logger.warning("未知组合熔断基准 %s，将降级为 first_seen", mode)
         baseline_set_date["d"] = today
 
+    def send_failure_alert(event: str, code: str, message: str) -> None:
+        """发送失败提醒；同一事件/标的在冷却期内只写日志。"""
+        if failure_alert_gate.should_send(event, code):
+            alerts.send(event, message)
+            return
+        logger.info("失败提醒冷却中，跳过 %s %s: %s", event, code, message)
+
     def process_quote(code: str, price: float) -> None:
         """单线程消费：评估并执行。仅此函数会改写策略状态与下单。"""
         if not _is_market_open(cfg):
@@ -298,6 +551,7 @@ def run() -> None:
             if _is_in_open_cooldown(cfg):
                 logger.info("开盘冷静期内，跳过买入 %s", code)
                 return
+            display = _get_symbol_display(data, code)
             _, lot_size = _get_snapshot(data, code)
             is_new = not strategy.has_position(code)
             ok, fill_price, filled = trader.buy(
@@ -315,21 +569,92 @@ def run() -> None:
                         qty=strategy.get_qty(code),
                     )
                 )
+                account_snapshot = _account_snapshot_text(data)
                 alerts.send(
                     "买入成功",
-                    f"{code} 成交均价={fill_price:.3f} qty={filled}"
-                    f" 第{strategy.get_tranches_bought(code)}/{cfg.entry_tranches}批",
+                    _buy_alert_message(
+                        display=display,
+                        signal_price=price,
+                        lot_size=lot_size,
+                        cfg=cfg,
+                        decision_reason=decision.reason,
+                        result="已成交",
+                        detail=(
+                            f"成交数量：qty={filled}\n"
+                            f"成交均价：{fill_price:.3f}\n"
+                            f"批次：第{strategy.get_tranches_bought(code)}/"
+                            f"{cfg.entry_tranches}批"
+                        ),
+                        account_snapshot=account_snapshot,
+                    ),
                 )
             else:
-                alerts.send("买入失败", f"{code} price={price:.3f} 下单未成交")
+                reason = trader.last_failure_reason or "买入未执行或未成交"
+                if _should_suppress_buy_failure_alert(reason):
+                    message = _buy_alert_message(
+                        display=display,
+                        signal_price=price,
+                        lot_size=lot_size,
+                        cfg=cfg,
+                        decision_reason=decision.reason,
+                        result="未执行",
+                        detail=f"原因：{reason}",
+                    )
+                    logger.info("资金不足类买入未执行，仅记录日志 %s: %s", code, message)
+                    return
+                account_snapshot = _account_snapshot_text(data)
+                message = _buy_alert_message(
+                    display=display,
+                    signal_price=price,
+                    lot_size=lot_size,
+                    cfg=cfg,
+                    decision_reason=decision.reason,
+                    result="未执行",
+                    detail=f"原因：{reason}",
+                    account_snapshot=account_snapshot,
+                )
+                send_failure_alert(
+                    "买入未执行",
+                    code,
+                    message,
+                )
 
         elif decision.signal == Signal.SELL:
+            display = _get_symbol_display(data, code)
+            broker_qty = trader.get_position_qty(code)
+            if _should_ignore_unheld_sell(strategy.has_position(code), broker_qty):
+                logger.info("无持仓，忽略卖出信号 %s: %s", code, decision.reason)
+                return
             if trader.sell(code, price):
                 strategy.clear_position(code)
                 store.delete(code)
-                alerts.send("卖出", f"{code} price={price:.3f} 原因: {decision.reason}")
+                account_snapshot = _account_snapshot_text(data)
+                alerts.send(
+                    "卖出",
+                    _sell_alert_message(
+                        display=display,
+                        signal_price=price,
+                        decision_reason=decision.reason,
+                        result="已提交并确认成交",
+                        detail="原因：卖出信号触发，执行清仓",
+                        account_snapshot=account_snapshot,
+                    ),
+                )
             else:
-                alerts.send("卖出失败", f"{code} price={price:.3f} 下单未成交")
+                reason = trader.last_failure_reason or "卖出未执行或未成交"
+                account_snapshot = _account_snapshot_text(data)
+                send_failure_alert(
+                    "卖出失败",
+                    code,
+                    _sell_alert_message(
+                        display=display,
+                        signal_price=price,
+                        decision_reason=decision.reason,
+                        result="未完成",
+                        detail=f"原因：{reason}",
+                        account_snapshot=account_snapshot,
+                    ),
+                )
 
     def consumer() -> None:
         while True:

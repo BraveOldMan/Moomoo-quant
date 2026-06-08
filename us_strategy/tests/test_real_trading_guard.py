@@ -55,6 +55,26 @@ def test_allow_real_trading_parsing(monkeypatch, value, expected):
     assert StrategyConfig.from_env().allow_real_trading is expected
 
 
+def test_trade_failure_alert_cooldown_from_env(monkeypatch):
+    _clear_trade_env(monkeypatch)
+    monkeypatch.setenv("TRADE_FAILURE_ALERT_COOLDOWN_S", "12.5")
+
+    cfg = StrategyConfig.from_env()
+
+    assert cfg.trade_failure_alert_cooldown_s == 12.5
+
+
+def test_order_timing_from_env(monkeypatch):
+    _clear_trade_env(monkeypatch)
+    monkeypatch.setenv("ORDER_FILL_TIMEOUT_S", "30")
+    monkeypatch.setenv("ORDER_POLL_INTERVAL_S", "0.5")
+
+    cfg = StrategyConfig.from_env()
+
+    assert cfg.order_fill_timeout_s == 30.0
+    assert cfg.order_poll_interval_s == 0.5
+
+
 def test_run_rejects_real_without_allow_flag(monkeypatch):
     # Arrange：请求实盘但未设二次确认开关
     _clear_trade_env(monkeypatch)
@@ -75,3 +95,22 @@ def test_run_requires_password_when_real_allowed(monkeypatch):
     # Act / Assert
     with pytest.raises(RuntimeError, match="TRADE_PASSWORD"):
         main.run()
+
+
+def test_us_trade_context_is_bound_to_us_market(monkeypatch) -> None:
+    calls = {}
+
+    class DummyTradeContext:
+        def __init__(self, **kwargs) -> None:
+            calls.update(kwargs)
+
+    monkeypatch.setattr(main.ft, "OpenSecTradeContext", DummyTradeContext)
+
+    ctx = main._open_trade_context(StrategyConfig(host="127.0.0.2", port=22222))
+
+    assert isinstance(ctx, DummyTradeContext)
+    assert calls == {
+        "filter_trdmarket": main.ft.TrdMarket.US,
+        "host": "127.0.0.2",
+        "port": 22222,
+    }
