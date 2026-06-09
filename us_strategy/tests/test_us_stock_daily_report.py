@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import moomoo as ft
 import pandas as pd
+import pytest
 
 from tools import run_us_stock_daily_report as daily
 
@@ -72,7 +73,9 @@ def test_load_positions_reads_existing_db_with_read_only_uri(
                         (4, "peak_price"),
                     ],
                 )
-            return FakeCursor([("US.AAPL", 100.0, "2026-06-05", 1, 110.0, 0, "regular")])
+            return FakeCursor(
+                [("US.AAPL", 100.0, "2026-06-05", 1, 110.0, 0, "regular")]
+            )
 
     def fake_connect(database_uri: str, uri: bool = False) -> FakeConnection:
         calls.append((database_uri, uri))
@@ -137,7 +140,10 @@ def test_resolve_lark_command_resolves_windows_lark(monkeypatch) -> None:
 
     command = daily.resolve_lark_command(["lark-cli", "im", "+messages-send"])
 
-    assert command[0] in {"powershell", r"C:\Users\MrLee\AppData\Roaming\npm\lark-cli.cmd"}
+    assert command[0] in {
+        "powershell",
+        r"C:\Users\MrLee\AppData\Roaming\npm\lark-cli.cmd",
+    }
     assert command[-2:] == ["im", "+messages-send"]
 
 
@@ -188,7 +194,9 @@ def test_build_lark_summary_card_contains_doc_link(tmp_path: Path) -> None:
 
     assert card["header"]["title"]["content"] == "美股日报 2026-06-05"
     assert "US.AAPL" in card["elements"][0]["text"]["content"]
-    assert card["elements"][-1]["actions"][0]["url"] == "https://www.feishu.cn/file/demo"
+    assert (
+        card["elements"][-1]["actions"][0]["url"] == "https://www.feishu.cn/file/demo"
+    )
 
 
 def test_write_lark_card_files_uses_interactive_body(tmp_path: Path) -> None:
@@ -210,7 +218,9 @@ def test_write_lark_card_files_uses_interactive_body(tmp_path: Path) -> None:
     card = json.loads(body["content"])
     assert body["receive_id"] == "oc_demo"
     assert body["msg_type"] == "interactive"
-    assert card["elements"][-1]["actions"][0]["url"] == "https://www.feishu.cn/file/demo"
+    assert (
+        card["elements"][-1]["actions"][0]["url"] == "https://www.feishu.cn/file/demo"
+    )
 
 
 def test_verify_lark_card_readback_requires_interactive_and_link() -> None:
@@ -439,7 +449,9 @@ def test_fetch_option_chains_keeps_exact_nonempty_response(monkeypatch) -> None:
     assert errors
 
 
-def test_run_report_no_send_uses_read_only_quote_context(tmp_path: Path, monkeypatch) -> None:
+def test_run_report_no_send_uses_read_only_quote_context(
+    tmp_path: Path, monkeypatch
+) -> None:
     watchlist = tmp_path / "watchlist.txt"
     watchlist.write_text("US.AAPL\n", encoding="utf-8")
     output = tmp_path / "out"
@@ -465,3 +477,150 @@ def test_run_report_no_send_uses_read_only_quote_context(tmp_path: Path, monkeyp
     assert paths.report_json.exists()
     saved = json.loads(paths.report_json.read_text(encoding="utf-8"))
     assert saved["stocks"][0]["code"] == "US.AAPL"
+
+
+# ── 健壮性与小增强（深度核查后新增）────────────────────────────────────────
+
+
+def test_select_atm_pair_prefers_lower_strike_on_tie() -> None:
+    chain = pd.DataFrame(
+        [
+            {"code": "US.C99", "option_type": "CALL", "strike_price": 99.0},
+            {"code": "US.P99", "option_type": "PUT", "strike_price": 99.0},
+            {"code": "US.C101", "option_type": "CALL", "strike_price": 101.0},
+            {"code": "US.P101", "option_type": "PUT", "strike_price": 101.0},
+        ],
+    )
+    # 99 与 101 距现价 100 等距 → 取不超过现价的下界 99（跨券商可复现）。
+    call, put = daily.select_atm_pair(chain, 100.0)
+    assert call["code"] == "US.C99"
+    assert put["code"] == "US.P99"
+
+
+def test_select_atm_pair_still_picks_nearest_when_not_equidistant() -> None:
+    chain = pd.DataFrame(
+        [
+            {"code": "US.C99", "option_type": "CALL", "strike_price": 99.0},
+            {"code": "US.P99", "option_type": "PUT", "strike_price": 99.0},
+            {"code": "US.C101", "option_type": "CALL", "strike_price": 101.0},
+            {"code": "US.P101", "option_type": "PUT", "strike_price": 101.0},
+        ],
+    )
+    # close=100.4：|101-100.4|=0.6 < |99-100.4|=1.4 → 仍取最近的 101。
+    call, _put = daily.select_atm_pair(chain, 100.4)
+    assert call["code"] == "US.C101"
+
+
+def test_verify_lark_card_readback_rejects_incidental_interactive_text() -> None:
+    # "interactive" 仅作为正文文本出现，真实 msg_type 是 text → 必须 fail-closed。
+    receipt = {
+        "stdout": {
+            "data": {
+                "items": [
+                    {
+                        "msg_type": "text",
+                        "body": {
+                            "content": (
+                                "interactive 美股日报 2026-06-05 "
+                                "https://www.feishu.cn/file/demo"
+                            ),
+                        },
+                    },
+                ],
+            },
+        },
+    }
+    with pytest.raises(daily.ReportError):
+        daily.verify_lark_card_readback(
+            receipt,
+            "https://www.feishu.cn/file/demo",
+            daily.date.fromisoformat("2026-06-05"),
+        )
+
+
+def test_verify_lark_card_readback_rejects_non_json_stdout() -> None:
+    # 回读 stdout 非 JSON（如错误文本）→ 无法结构化验证卡片 → fail-closed。
+    receipt = {"stdout": "interactive 美股日报 2026-06-05 https://x"}
+    with pytest.raises(daily.ReportError):
+        daily.verify_lark_card_readback(
+            receipt, "https://x", daily.date.fromisoformat("2026-06-05")
+        )
+
+
+def test_option_quote_call_uses_exponential_backoff(monkeypatch) -> None:
+    sleeps: list[float] = []
+    monkeypatch.setattr(daily.time_module, "sleep", lambda s: sleeps.append(s))
+    monkeypatch.setattr(daily, "OPTION_API_MAX_ATTEMPTS", 4)
+    monkeypatch.setattr(daily, "OPTION_API_RETRY_DELAY_SECONDS", 1.0)
+    attempts = {"n": 0}
+
+    def always_fail() -> tuple[object, str]:
+        attempts["n"] += 1
+        return ft.RET_ERROR, "transient"
+
+    ret, _ = daily.option_quote_call(always_fail)
+
+    assert ret == ft.RET_ERROR
+    assert attempts["n"] == 4
+    # 指数退避：2^0, 2^1, 2^2 = 1, 2, 4（线性会是 1, 2, 3）。
+    assert sleeps == [1.0, 2.0, 4.0]
+
+
+def test_build_payload_warns_when_all_options_are_gaps(tmp_path: Path) -> None:
+    target = daily.date.fromisoformat("2026-06-05")
+    cfg = daily.StrategyConfig()
+    paths = daily.build_paths(target, tmp_path / "out")
+    stocks = [{"signal": daily.Signal.HOLD.value}]
+    options = [daily.option_gap_row("US.AAPL", target, "no_option_data")]
+
+    payload = daily.build_payload(
+        target_date=target,
+        generated_at=daily.datetime.now(daily.BEIJING_TZ),
+        paths=paths,
+        config=cfg,
+        codes=("US.AAPL",),
+        indexes=[],
+        stocks=stocks,
+        options=options,
+        warnings=[],
+    )
+
+    assert any("期权数据整体缺失" in w for w in payload["summary"]["warnings"])
+
+
+def test_build_payload_no_option_warning_when_any_valid(tmp_path: Path) -> None:
+    target = daily.date.fromisoformat("2026-06-05")
+    cfg = daily.StrategyConfig()
+    paths = daily.build_paths(target, tmp_path / "out")
+    stocks = [{"signal": daily.Signal.HOLD.value}]
+    options = [
+        daily.option_gap_row("US.AAPL", target, "no_option_data"),
+        {"underlying": "US.MSFT", "gap": ""},
+    ]
+
+    payload = daily.build_payload(
+        target_date=target,
+        generated_at=daily.datetime.now(daily.BEIJING_TZ),
+        paths=paths,
+        config=cfg,
+        codes=("US.AAPL", "US.MSFT"),
+        indexes=[],
+        stocks=stocks,
+        options=options,
+        warnings=[],
+    )
+
+    assert not any("期权数据整体缺失" in w for w in payload["summary"]["warnings"])
+
+
+def test_validate_target_date_fail_closed_before_ready_boundary() -> None:
+    target = daily.date.fromisoformat("2026-06-05")  # 周五，交易日
+    close_moment = daily.datetime.combine(
+        target, daily.MARKET_CLOSE, tzinfo=daily.US_TZ
+    )
+    # 收盘瞬间（未到收盘后 30 分钟）→ fail closed。
+    with pytest.raises(daily.ReportError):
+        daily.validate_target_date(target, close_moment, False, False)
+    # 收盘后 30 分钟 +1 分钟 → 就绪，不 raise。
+    ready = close_moment + daily.timedelta(minutes=daily.REPORT_DELAY_MINUTES + 1)
+    daily.validate_target_date(target, ready, False, False)

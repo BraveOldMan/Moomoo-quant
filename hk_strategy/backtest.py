@@ -272,10 +272,20 @@ class BacktestEngine:
         benchmark_curve: list[float] = []
         history: dict[str, dict[str, list[float]]] = {}
         bench_closes: list[float] = []
+        prev_day_equity = self._initial_cash
 
         for dt in trade_dates:
             dt_key = str(dt)
             day_data = all_data[all_data["time_key"] == dt]
+            # 组合熔断（与实盘 check_and_update_circuit_breaker 一致）：当日组合净值
+            # （按今日收盘市值）较上一交易日回撤 ≥ daily_loss_limit_pct → 当日阻断新开/加仓。
+            day_equity = cash + self._holdings_value(positions, all_data, dt)
+            breaker_active = (
+                cfg.daily_loss_limit_pct > 0
+                and prev_day_equity > 0
+                and (prev_day_equity - day_equity) / prev_day_equity
+                >= cfg.daily_loss_limit_pct
+            )
 
             for _, row in day_data.iterrows():
                 code = str(row["code"])
@@ -283,8 +293,12 @@ class BacktestEngine:
                 high = float(row.get("high") or close)
                 low = float(row.get("low") or close)
                 turnover_usd = float(row.get("turnover") or 0)
+                # kline 的 turnover_rate 为小数（如 0.05），实盘 snapshot 为百分数（5.0）；
+                # ×100 对齐到同一百分数口径，以匹配 turnover_warning/danger 阈值单位。
                 turnover_rate = float(row.get("turnover_rate") or 0) * 100.0
-                main_flow = float(row.get("main_in_flow") or 0)
+                # None 表示无真实资金流数据（capital_flow 列缺失/NaN）；与实盘一致：
+                # 无机构资金流数据时丢弃 capital 因子，而非注入中性分稀释综合分。
+                main_flow = _finite_or_none(row.get("main_in_flow"))
                 short_percent = _finite_or_none(row.get("short_percent"))
 
                 h = history.setdefault(
@@ -307,6 +321,8 @@ class BacktestEngine:
                         h["high"], h["low"], h["close"], cfg.atr_period
                     )
                     buy_blocks = self._buy_block_reasons(dt_key, filter_data)
+                    if breaker_active:
+                        buy_blocks = [*buy_blocks, "组合熔断: 当日亏损超限"]
                     cash, _ = self._apply_decision(
                         dt_key,
                         code,
@@ -329,6 +345,7 @@ class BacktestEngine:
                 h["short_percent"].append(short_percent)
 
             equity_curve.append(cash + self._holdings_value(positions, all_data, dt))
+            prev_day_equity = equity_curve[-1]
             if dt_key in bench:
                 bench_closes.append(bench[dt_key])
             if bench_closes:
@@ -367,16 +384,15 @@ class BacktestEngine:
         turnover_usd = h["turnover"][-1]
         main_flow = h["main_flow"][-1]
         warn, danger = self._turnover_thresholds(code)
-        scores = {
-            "turnover": features.turnover_score(turnover_rate, warn, danger),
-            "capital": features.capital_flow_score(main_flow, turnover_usd),
-        }
         closes = h["close"]
+        # ── 共享 K 线因子（turnover/momentum/rs，与实盘同源 features.kline_factor_scores）──
+        momentum_change = None
         if len(closes) >= 2:
             bars = min(cfg.momentum_bars, len(closes))
             first, last = closes[-bars], closes[-1]
             if first > 0:
-                scores["momentum"] = features.momentum_score((last - first) / first)
+                momentum_change = (last - first) / first
+        rs_pair = None
         if (
             cfg.use_rs
             and len(closes) > cfg.rs_lookback_days
@@ -385,7 +401,19 @@ class BacktestEngine:
             lb = cfg.rs_lookback_days
             s_ret = (closes[-1] - closes[-1 - lb]) / closes[-1 - lb]
             b_ret = (bench_closes[-1] - bench_closes[-1 - lb]) / bench_closes[-1 - lb]
-            scores["rs"] = features.rs_score(s_ret, b_ret)
+            rs_pair = (s_ret, b_ret)
+        scores = features.kline_factor_scores(
+            turnover_rate=turnover_rate,
+            turnover_warn=warn,
+            turnover_danger=danger,
+            momentum_change=momentum_change,
+            rs=rs_pair,
+        )
+        # capital 仅在有真实逐根资金流数据时计入（与实盘"无资金分布则丢弃"一致）。
+        # 注意：回测 capital 为净流强度代理，与实盘 capital_outflow_score 口径不同，
+        # 须以前向 IC 校准，不以历史综合回测为准。
+        if main_flow is not None:
+            scores["capital"] = features.capital_flow_score(main_flow, turnover_usd)
         if cfg.use_short_metrics and h.get("short_percent"):
             short_pct = h["short_percent"][-1]
             if short_pct is not None and short_pct > 0:

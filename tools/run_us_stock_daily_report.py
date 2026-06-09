@@ -674,7 +674,8 @@ def option_quote_call(func: Any) -> tuple[Any, Any]:
                 time_module.sleep(OPTION_API_SUCCESS_PAUSE_SECONDS)
             return result
         if attempt < OPTION_API_MAX_ATTEMPTS - 1 and OPTION_API_RETRY_DELAY_SECONDS > 0:
-            time_module.sleep(OPTION_API_RETRY_DELAY_SECONDS * (attempt + 1))
+            # 指数退避（1x, 2x, 4x ...）：对限频/超时比线性更友好。
+            time_module.sleep(OPTION_API_RETRY_DELAY_SECONDS * (2**attempt))
     return result
 
 
@@ -803,7 +804,11 @@ def select_atm_pair(
     common = [strike for strike in calls if strike in puts]
     if not common:
         return None
-    strike = min(common, key=lambda value: abs(value - latest_close))
+    # 最近优先；等距时优先取不超过现价的下界 strike（标准 ATM 约定，跨券商可复现）。
+    strike = min(
+        common,
+        key=lambda value: (abs(value - latest_close), value > latest_close),
+    )
     return calls[strike], puts[strike]
 
 
@@ -1548,6 +1553,24 @@ def extract_takeaways(summary_path: Path) -> list[str]:
     return takeaways
 
 
+def has_interactive_msg_type(payload: Any) -> bool:
+    """Recursively check the readback carries a real msg_type == 'interactive'.
+
+    Structured match on the actual ``msg_type`` field, so an incidental
+    "interactive" substring in unrelated text cannot satisfy fail-closed.
+    """
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if key == "msg_type" and value == "interactive":
+                return True
+            if has_interactive_msg_type(value):
+                return True
+    elif isinstance(payload, list):
+        return any(has_interactive_msg_type(item) for item in payload)
+    return False
+
+
 def verify_lark_card_readback(
     receipt: dict[str, Any],
     doc_url: str | None,
@@ -1555,9 +1578,10 @@ def verify_lark_card_readback(
 ) -> None:
     """Verify raw message readback contains the interactive card and doc link."""
 
-    raw = json.dumps(receipt.get("stdout"), ensure_ascii=False)
-    if "interactive" not in raw:
+    stdout = receipt.get("stdout")
+    if not has_interactive_msg_type(stdout):
         raise ReportError("lark card readback missing interactive msg_type")
+    raw = json.dumps(stdout, ensure_ascii=False)
     if f"美股日报 {target_date.isoformat()}" not in raw:
         raise ReportError("lark card readback missing report title")
     if doc_url and doc_url not in raw:
@@ -1587,6 +1611,10 @@ def build_payload(
         name: sum(1 for row in stocks if row["signal"] == name)
         for name in (Signal.BUY.value, Signal.HOLD.value, Signal.SELL.value)
     }
+    warnings = list(warnings)
+    # 期权为可选限深口径：若有标的但所有期权行均为缺口，显式告警（不 fail-closed）。
+    if stocks and options and all(row.get("gap") for row in options):
+        warnings.append("期权数据整体缺失：所有标的均无有效 ATM 期权对")
     return {
         "summary": {
             "target_date": target_date.isoformat(),
@@ -1658,12 +1686,14 @@ def run_report(
     """Run the full read-only daily report workflow."""
 
     explicit_date = bool(args.date)
+    now_us = datetime.now(US_TZ)
     target_date = infer_target_date(
+        now=now_us,
         explicit_date=date.fromisoformat(args.date) if args.date else None,
     )
     paths = build_paths(target_date, Path(args.output_dir) if args.output_dir else None)
     try:
-        validate_target_date(target_date, None, explicit_date, args.force)
+        validate_target_date(target_date, now_us, explicit_date, args.force)
         paths.output_dir.mkdir(parents=True, exist_ok=True)
         codes = load_us_watchlist(Path(args.watchlist))
         if not codes:

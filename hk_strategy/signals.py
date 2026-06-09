@@ -110,10 +110,8 @@ class SignalCalculator:
         risk_warnings: list[str] = []
         buy_block_reasons: list[str] = []
 
-        # ── 换手率（核心，按标的自动分 IPO/成熟股 profile）──────────
+        # ── 换手率阈值（核心，按标的自动分 IPO/成熟股 profile）────────
         warn, danger = self._turnover_thresholds(code)
-        if rate is not None:
-            scores["turnover"] = features.turnover_score(rate, warn, danger)
 
         # ── 机构资金分布（核心；港股通常可用，缺失则降级）────────────
         out_ratio = self._capital_out_ratio(code)
@@ -123,20 +121,31 @@ class SignalCalculator:
             )
             extra["inst_out_ratio"] = out_ratio
 
-        # ── 日线衍生：动量 / ATR / RS ───────────────────────────────
+        # ── 日线衍生：动量 / ATR / RS（取输入，打分走共享函数）────────
         daily = self._daily_kline(code)
         atr_val = None
+        mom = None
+        rs_pair = None
         if daily is not None and not daily.empty:
             mom = self._momentum_change(daily)
             if mom is not None:
-                scores["momentum"] = features.momentum_score(mom)
                 extra["momentum_change"] = mom
             atr_val = self._atr(daily)
             if cfg.use_rs:
-                rs = self._rs(daily)
-                if rs is not None:
-                    scores["rs"] = features.rs_score(*rs)
-                    extra["rs"] = rs
+                rs_pair = self._rs(daily)
+                if rs_pair is not None:
+                    extra["rs"] = rs_pair
+
+        # ── 共享 K 线因子（turnover/momentum/rs，与回测同源，杜绝口径漂移）──
+        scores.update(
+            features.kline_factor_scores(
+                turnover_rate=rate,
+                turnover_warn=warn,
+                turnover_danger=danger,
+                momentum_change=mom,
+                rs=rs_pair,
+            )
+        )
 
         # ── 盘中分钟线衍生：ORB / VWAP ──────────────────────────────
         if (cfg.use_orb or cfg.use_vwap_signal) and last_price:

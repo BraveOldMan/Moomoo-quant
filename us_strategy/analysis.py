@@ -129,7 +129,10 @@ def forward_ic_from_log(
     for r in records:
         if factor not in getattr(r, "scores", {}):
             continue
-        if session_filter and getattr(r, "market_session", "").upper() != session_filter:
+        if (
+            session_filter
+            and getattr(r, "market_session", "").upper() != session_filter
+        ):
             continue
         by_code.setdefault(r.code, []).append(r)
 
@@ -186,10 +189,14 @@ class FactorAnalyzer:
         h = self._horizon
         panel: dict[str, list[float]] = {
             "turnover": [],
-            "capital": [],
             "momentum": [],
             "forward_return": [],
         }
+        # capital 仅在数据完整含真实逐根资金流时纳入历史 IC（与实盘/回测一致）。
+        # 历史 capital_flow_score 为净流强度代理，与实盘 capital_outflow_score 口径不同，
+        # 数据缺失时丢弃，改由 forward_ic_from_log 前向校准。
+        capital_vals: list[float] = []
+        capital_complete = True
         for code in codes:
             df = self._fetch(code, start, end)
             if df.empty or len(df) < h + 2:
@@ -201,13 +208,20 @@ class FactorAnalyzer:
                 # K 线 turnover_rate 为小数(0.01=1%)，×100 转百分数与阈值口径一致
                 t_rate = float(row.get("turnover_rate") or 0) * 100.0
                 t_usd = float(row.get("turnover") or 0)
-                flow = float(row.get("main_in_flow") or 0)
+                raw_flow = row.get("main_in_flow")
+                # None=无该列；raw != raw → NaN（无 import 的 NaN 自检）。
+                if raw_flow is None or raw_flow != raw_flow:
+                    capital_complete = False
+                    capital_vals.append(50.0)  # 占位；capital 不完整时整列丢弃
+                else:
+                    capital_vals.append(
+                        features.capital_flow_score(float(raw_flow), t_usd)
+                    )
                 panel["turnover"].append(
                     features.turnover_score(
                         t_rate, cfg.turnover_warning, cfg.turnover_danger
                     )
                 )
-                panel["capital"].append(features.capital_flow_score(flow, t_usd))
                 bars = min(cfg.momentum_bars, i + 1)
                 if bars >= 2 and closes[i - bars + 1] > 0:
                     chg = (closes[i] - closes[i - bars + 1]) / closes[i - bars + 1]
@@ -215,6 +229,8 @@ class FactorAnalyzer:
                 else:
                     panel["momentum"].append(50.0)
                 panel["forward_return"].append(fwd)
+        if capital_complete and capital_vals:
+            panel["capital"] = capital_vals
         return panel
 
     def factor_ic(self, codes: list[str], start: str, end: str) -> dict[str, ICSummary]:

@@ -238,3 +238,31 @@ def test_atr_position_size_invalid_inputs():
     assert F.atr_position_size(0, 50, 2, 0.01, 2).qty == 0
     assert F.atr_position_size(100_000, 0, 2, 0.01, 2).qty == 0
     assert F.atr_position_size(100_000, 50, 0, 0.01, 2).qty == 0
+
+
+def test_kline_factor_scores_matches_individual_functions():
+    # 实盘/回测共用入口：结果须等于逐个调用各纯函数（单一来源，杜绝漂移）。
+    scores = F.kline_factor_scores(
+        turnover_rate=5.0,
+        turnover_warn=5.0,
+        turnover_danger=15.0,
+        momentum_change=0.1,
+        rs=(0.05, 0.02),
+    )
+    assert scores["turnover"] == F.turnover_score(5.0, 5.0, 15.0)
+    assert scores["momentum"] == F.momentum_score(0.1)
+    assert scores["rs"] == F.rs_score(0.05, 0.02)
+
+
+def test_kline_factor_scores_omits_none_inputs():
+    # 输入为 None 的因子不计入（与"数据缺失则剔除并重新归一化"一致）。
+    assert (
+        F.kline_factor_scores(
+            turnover_rate=None,
+            turnover_warn=5.0,
+            turnover_danger=15.0,
+            momentum_change=None,
+            rs=None,
+        )
+        == {}
+    )

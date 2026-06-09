@@ -4,6 +4,7 @@
 import pandas as pd
 import moomoo as ft
 
+from hk_strategy import features
 from hk_strategy.backtest import BacktestEngine
 from hk_strategy.config import StrategyConfig
 
@@ -130,9 +131,7 @@ def test_backtest_hk_futures_filter_blocks_new_buys() -> None:
         hk_futures_filter_block_score=60.0,
         min_daily_turnover=1_000_000,
     )
-    result = BacktestEngine(quote, cfg).run(
-        ["HK.TEST"], "2024-01-02", "2024-01-05"
-    )
+    result = BacktestEngine(quote, cfg).run(["HK.TEST"], "2024-01-02", "2024-01-05")
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]
 
@@ -163,9 +162,7 @@ def test_backtest_short_factor_uses_prior_day_short_volume() -> None:
         buy_threshold=50.0,
     )
 
-    result = BacktestEngine(quote, cfg).run(
-        ["HK.TEST"], "2024-01-02", "2024-01-04"
-    )
+    result = BacktestEngine(quote, cfg).run(["HK.TEST"], "2024-01-02", "2024-01-04")
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]
 
@@ -178,3 +175,105 @@ def test_backtest_report_uses_hk_benchmark_label() -> None:
 
     assert "HK.800000 buy&hold" in result.report()
     assert "SPY buy&hold" not in result.report()
+
+
+# ── 回测↔主策略一致性（深度核查后新增）────────────────────────────────────
+
+
+def _score_history(main_flow, closes, short_percent=None):
+    n = len(closes)
+    return {
+        "turnover_rate": [5.0] * n,
+        "turnover": [2_000_000.0] * n,
+        "main_flow": list(main_flow),
+        "close": list(closes),
+        "high": list(closes),
+        "low": list(closes),
+        "short_percent": list(short_percent) if short_percent else [None] * n,
+    }
+
+
+def test_score_drops_capital_without_flow_data() -> None:
+    cfg = StrategyConfig()
+    engine = BacktestEngine(_Quote({}), cfg)
+    weights = cfg.active_weights()
+    h = _score_history([None, None], [10.0, 11.0])
+
+    got = engine._score("HK.X", h, [], weights)
+
+    warn, danger = engine._turnover_thresholds("HK.X")
+    expected = features.score_from_features(
+        {
+            "turnover": features.turnover_score(5.0, warn, danger),
+            "momentum": features.momentum_score((11.0 - 10.0) / 10.0),
+        },
+        weights,
+    )
+    assert got == expected
+
+
+def test_score_includes_capital_when_flow_present() -> None:
+    cfg = StrategyConfig()
+    engine = BacktestEngine(_Quote({}), cfg)
+    weights = cfg.active_weights()
+    h = _score_history([None, 50_000.0], [10.0, 11.0])
+
+    got = engine._score("HK.X", h, [], weights)
+
+    warn, danger = engine._turnover_thresholds("HK.X")
+    expected = features.score_from_features(
+        {
+            "turnover": features.turnover_score(5.0, warn, danger),
+            "capital": features.capital_flow_score(50_000.0, 2_000_000.0),
+            "momentum": features.momentum_score((11.0 - 10.0) / 10.0),
+        },
+        weights,
+    )
+    assert got == expected
+
+
+def test_score_short_matches_live_short_volume_only() -> None:
+    cfg = StrategyConfig(use_short_metrics=True, w_short=0.1)
+    engine = BacktestEngine(_Quote({}), cfg)
+    weights = cfg.active_weights()
+    h = _score_history([None, None], [10.0, 10.0], short_percent=[20.0, 25.0])
+
+    got = engine._score("HK.X", h, [], weights)
+
+    warn, danger = engine._turnover_thresholds("HK.X")
+    expected = features.score_from_features(
+        {
+            "turnover": features.turnover_score(5.0, warn, danger),
+            "momentum": features.momentum_score(0.0),
+            "short": features.short_volume_score(25.0),
+        },
+        weights,
+    )
+    assert got == expected
+
+
+def test_backtest_circuit_breaker_blocks_new_buys_on_daily_loss() -> None:
+    a = _bars("HK.A", closes=[10.0, 10.0, 10.0, 2.0])
+    x = _bars(
+        "HK.X",
+        closes=[10.0, 10.0, 10.0, 10.0],
+        turnovers=[10_000.0, 10_000.0, 5_000_000.0, 5_000_000.0],
+    )
+    bench = _bars("HK.800000", closes=[10.0, 10.0, 10.0, 10.0])
+
+    def x_bought(daily_loss_limit_pct: float) -> bool:
+        quote = _Quote({"HK.A": a.copy(), "HK.X": x.copy(), "HK.800000": bench.copy()})
+        cfg = StrategyConfig(
+            entry_tranches=1,
+            max_positions=5,
+            min_daily_turnover=1_000_000,
+            buy_threshold=35.0,
+            daily_loss_limit_pct=daily_loss_limit_pct,
+        )
+        result = BacktestEngine(quote, cfg).run(
+            ["HK.A", "HK.X"], "2024-01-02", "2024-01-05"
+        )
+        return any(t.code == "HK.X" and t.side == "BUY" for t in result.trades)
+
+    assert x_bought(0.0) is True
+    assert x_bought(0.001) is False

@@ -49,9 +49,14 @@ def momentum_score(change_pct: float) -> float:
 
 
 def capital_flow_score(main_in_flow: float, turnover_usd: float) -> float:
-    """资金流强度风险分（实盘资金分布不可用时的兜底，回测同源使用）。
+    """资金流强度风险分（净流入强度代理；仅回测/历史 IC 使用）。
 
     main_in_flow>0 净流入→低风险；净流出→高风险。按成交额归一化消除规模差异。
+
+    口径说明：实盘 capital 因子用 capital_outflow_score(机构流出/总额比，来自
+    get_capital_distribution 快照，无历史)，**不调用本函数**；本函数是回测/分析用
+    历史 main_in_flow 的代理。两者口径不同，故回测仅在确有逐根资金流数据时计入
+    capital，否则丢弃；capital 因子须以 forward_ic_from_log 前向校准，不以历史综合回测为准。
     """
     if turnover_usd <= 0:
         return 50.0
@@ -324,6 +329,35 @@ def score_from_features(scores: dict[str, float], weights: dict[str, float]) -> 
     if total_w <= 0:
         return 50.0
     return sum(scores[k] * w for k, w in usable.items()) / total_w
+
+
+def kline_factor_scores(
+    *,
+    turnover_rate: float | None,
+    turnover_warn: float,
+    turnover_danger: float,
+    momentum_change: float | None,
+    rs: tuple[float, float] | None,
+) -> dict[str, float]:
+    """实盘/回测共用的 K 线派生因子打分（turnover / momentum / rs）。
+
+    这三个因子在实盘与回测中用相同数据语义计算，集中于此作为唯一来源以杜绝口径
+    漂移：新增同类纯 K 线因子只需改这里，两条链路自动获得。各输入为 None 时对应
+    因子不计入（与"数据缺失则剔除并重新归一化"一致）。
+
+    capital（实盘=机构流出比快照 / 回测=历史净流代理）与 short（实盘叠加
+    short_interest）因数据源不同无法在此统一，仍由各链路各自计算。
+    """
+    scores: dict[str, float] = {}
+    if turnover_rate is not None:
+        scores["turnover"] = turnover_score(
+            turnover_rate, turnover_warn, turnover_danger
+        )
+    if momentum_change is not None:
+        scores["momentum"] = momentum_score(momentum_change)
+    if rs is not None:
+        scores["rs"] = rs_score(*rs)
+    return scores
 
 
 # ── 技术指标 ────────────────────────────────────────────────────────────

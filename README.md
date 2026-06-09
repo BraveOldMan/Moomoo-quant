@@ -1,6 +1,6 @@
 # Moomoo Quant
 
-> Current version: `v1.9.0` (2026-06-09)
+> Current version: `v1.10.0` (2026-06-09)
 
 Moomoo Quant is a dual-market quantitative trading and research framework built on top of the
 moomoo OpenD gateway, formerly known as the Futu OpenAPI gateway. It covers both US equities and
@@ -578,6 +578,17 @@ Before changing strategy logic, validate at least:
 - No PowerShell JSON or report-generation logic added outside Python.
 
 ## Release Highlights
+
+### v1.10.0
+
+- Audited the US daily-report skill and hardened it without changing its outputs: structured (not substring) interactive-card readback validation, a single `now` shared by trading-day inference and the fail-closed readiness check, ATM tie-break preferring the strike at or below spot, exponential option-API backoff, and an explicit warning when every watchlist name lacks option data.
+- Aligned the backtest with the live strategy and documented the boundary of "what you test is what you trade":
+  - `capital` (the highest-weight core factor) is only scored in the backtest/analysis when real per-bar institutional-flow data exists; otherwise it is dropped so the composite renormalizes exactly as the live path does when capital distribution is unavailable. Live uses `capital_outflow_score` (snapshot); the backtest proxy `capital_flow_score` is documented as calibration-by-forward-IC only.
+  - Added a daily-loss circuit breaker to the backtest loop mirroring the live `check_and_update_circuit_breaker` (blocks new opens/add-ons when the day's drawdown exceeds `daily_loss_limit_pct`).
+  - Documented the kline `turnover_rate` ×100 unit alignment and the short-factor graceful degradation.
+- Extracted `features.kline_factor_scores` as the single shared scorer for the kline-derivable factors (`turnover` / `momentum` / `rs`), called by both live `signals` and `backtest` so those factors can never drift apart.
+- Added a factor-consistency drift guard: a test that pins the full weighted-factor universe from `active_weights()` and forces every factor to be classified as backtestable or forward-only, so any new weighted factor fails CI until it is consciously classified (and, if backtestable, mirrored into the backtest).
+- All changes applied to both US and HK packages; full suite green (428 tests), `ruff` clean.
 
 ### v1.9.0
 

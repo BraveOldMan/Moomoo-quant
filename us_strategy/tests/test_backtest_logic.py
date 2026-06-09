@@ -4,6 +4,7 @@
 import pandas as pd
 import moomoo as ft
 
+from us_strategy import features
 from us_strategy.backtest import BacktestEngine
 from us_strategy.config import StrategyConfig
 
@@ -69,7 +70,9 @@ def test_backtest_respects_max_positions() -> None:
         }
     )
     cfg = StrategyConfig(entry_tranches=1, max_positions=1)
-    result = BacktestEngine(quote, cfg).run(["US.A", "US.B"], "2024-01-02", "2024-01-04")
+    result = BacktestEngine(quote, cfg).run(
+        ["US.A", "US.B"], "2024-01-02", "2024-01-04"
+    )
 
     buy_codes = {trade.code for trade in result.trades if trade.side == "BUY"}
 
@@ -105,9 +108,7 @@ def test_backtest_macro_filter_blocks_new_buys() -> None:
         macro_filter_lookback_days=1,
         macro_filter_block_score=60.0,
     )
-    result = BacktestEngine(quote, cfg).run(
-        ["US.TEST"], "2024-01-02", "2024-01-05"
-    )
+    result = BacktestEngine(quote, cfg).run(["US.TEST"], "2024-01-02", "2024-01-05")
 
     assert not [trade for trade in result.trades if trade.side == "BUY"]
 
@@ -172,3 +173,112 @@ def test_backtest_short_factor_allows_low_short_new_buys() -> None:
     )
 
     assert [trade for trade in result.trades if trade.side == "BUY"]
+
+
+# ── 回测↔主策略一致性（深度核查后新增）────────────────────────────────────
+
+
+def _score_history(main_flow, closes, short_percent=None):
+    n = len(closes)
+    return {
+        "turnover_rate": [5.0] * n,
+        "turnover": [2_000_000.0] * n,
+        "main_flow": list(main_flow),
+        "close": list(closes),
+        "high": list(closes),
+        "low": list(closes),
+        "short_percent": list(short_percent) if short_percent else [None] * n,
+    }
+
+
+def test_score_drops_capital_without_flow_data() -> None:
+    # main_in_flow 缺失（美股默认）→ capital 丢弃，综合分仅 turnover+momentum 归一化，
+    # 与实盘"资金分布不可用则丢弃 capital"一致。
+    cfg = StrategyConfig()
+    engine = BacktestEngine(_Quote({}), cfg)
+    weights = cfg.active_weights()
+    h = _score_history([None, None], [10.0, 11.0])
+
+    got = engine._score("US.X", h, [], weights)
+
+    warn, danger = engine._turnover_thresholds("US.X")
+    expected = features.score_from_features(
+        {
+            "turnover": features.turnover_score(5.0, warn, danger),
+            "momentum": features.momentum_score((11.0 - 10.0) / 10.0),
+        },
+        weights,
+    )
+    assert got == expected
+
+
+def test_score_includes_capital_when_flow_present() -> None:
+    # 有真实逐根资金流 → capital 计入（capital_flow_score 代理）。
+    cfg = StrategyConfig()
+    engine = BacktestEngine(_Quote({}), cfg)
+    weights = cfg.active_weights()
+    h = _score_history([None, 50_000.0], [10.0, 11.0])
+
+    got = engine._score("US.X", h, [], weights)
+
+    warn, danger = engine._turnover_thresholds("US.X")
+    expected = features.score_from_features(
+        {
+            "turnover": features.turnover_score(5.0, warn, danger),
+            "capital": features.capital_flow_score(50_000.0, 2_000_000.0),
+            "momentum": features.momentum_score((11.0 - 10.0) / 10.0),
+        },
+        weights,
+    )
+    assert got == expected
+
+
+def test_score_short_matches_live_short_volume_only() -> None:
+    # 回测 short == 实盘"仅 daily_short_volume"分支 == features.short_volume_score(pct)。
+    cfg = StrategyConfig(use_short_metrics=True, w_short=0.1)
+    engine = BacktestEngine(_Quote({}), cfg)
+    weights = cfg.active_weights()
+    h = _score_history([None, None], [10.0, 10.0], short_percent=[20.0, 25.0])
+
+    got = engine._score("US.X", h, [], weights)
+
+    warn, danger = engine._turnover_thresholds("US.X")
+    expected = features.score_from_features(
+        {
+            "turnover": features.turnover_score(5.0, warn, danger),
+            "momentum": features.momentum_score(0.0),
+            "short": features.short_volume_score(25.0),
+        },
+        weights,
+    )
+    assert got == expected
+
+
+def test_backtest_circuit_breaker_blocks_new_buys_on_daily_loss() -> None:
+    # A 在 day3 暴跌→组合回撤超 daily_loss_limit_pct→当日阻断新开仓；
+    # B 因 day2 流动性不足、day3 才可买：熔断开启时 B 被挡，关闭时 B 买入。
+    # 决策用上一日数据：X 成交额[低,低,高,高]→前一日成交额到 day4 才达标→X 仅 day4 可买。
+    a = _bars("US.A", closes=[10.0, 10.0, 10.0, 2.0])  # day4 暴跌制造组合亏损
+    x = _bars(
+        "US.X",
+        closes=[10.0, 10.0, 10.0, 10.0],
+        turnovers=[10_000.0, 10_000.0, 5_000_000.0, 5_000_000.0],
+    )
+    spy = _bars("US.SPY", closes=[10.0, 10.0, 10.0, 10.0])
+
+    def x_bought(daily_loss_limit_pct: float) -> bool:
+        quote = _Quote({"US.A": a.copy(), "US.X": x.copy(), "US.SPY": spy.copy()})
+        cfg = StrategyConfig(
+            entry_tranches=1,
+            max_positions=5,
+            min_daily_turnover_usd=1_000_000,
+            buy_threshold=35.0,
+            daily_loss_limit_pct=daily_loss_limit_pct,
+        )
+        result = BacktestEngine(quote, cfg).run(
+            ["US.A", "US.X"], "2024-01-02", "2024-01-05"
+        )
+        return any(t.code == "US.X" and t.side == "BUY" for t in result.trades)
+
+    assert x_bought(0.0) is True  # 关闭熔断：X 在 day4 被买入
+    assert x_bought(0.001) is False  # 开启熔断：A 暴跌触发熔断，X 被阻断
